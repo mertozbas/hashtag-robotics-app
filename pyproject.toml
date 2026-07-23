@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hashtag-robotics"
+version = "0.1.0"
+description = "Local-first SO-101 control plane and agent-safe robotics dashboard"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "Proprietary" }
+authors = [{ name = "Hashtag Robotics" }]
+dependencies = [
+  "fastapi>=0.116,<1",
+  "packaging>=24.2",
+  "pydantic>=2.11,<3",
+  "pydantic-settings>=2.10,<3",
+  "pyserial>=3.5,<4",
+  "typer>=0.16,<1",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+agents = [
+  "strands-agents>=1.48,<2",
+]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.1,<2",
+  "ruff>=0.12,<1",
+]
+sim = [
+  "mujoco>=3.3,<4",
+]
+so101 = [
+  "lerobot>=0.6,<0.7",
+]
+
+[project.scripts]
+hashtag-robotics = "hashtag_robotics.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hashtag_robotics"]
+
+[tool.hatch.build]
+include = [
+  "src/hashtag_robotics/**/*.py",
+  "src/hashtag_robotics/web/**/*",
+]
+artifacts = [
+  "src/hashtag_robotics/web/**/*",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/hashtag_robotics",
+  "README.md",
+  "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.format]
+quote-style = "double"
