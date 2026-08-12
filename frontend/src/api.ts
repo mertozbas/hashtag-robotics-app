@@ -1,13 +1,47 @@
 export type CheckStatus = "pass" | "warning" | "blocked" | "not_applicable";
 export type TargetMode = "read_only" | "sim" | "real";
 
+export interface ResolvedTargets {
+  robot_profile_id?: string | null;
+  robot_type?: string | null;
+  robot_id?: string | null;
+  robot_port?: string | null;
+  robot_calibration_dir?: string | null;
+  robot_calibration_revision?: string | null;
+  teleoperator_profile_id?: string | null;
+  teleop_type?: string | null;
+  teleop_id?: string | null;
+  teleop_port?: string | null;
+  teleop_calibration_dir?: string | null;
+  teleop_calibration_revision?: string | null;
+  camera_profile_ids: Record<string, string>;
+  max_relative_target?: number | null;
+  action_shape: number[];
+}
+
+export interface SafetyCheck {
+  code: string;
+  label: string;
+  status: CheckStatus;
+  message: string;
+}
+
+export interface PreflightResult {
+  allowed: boolean;
+  requires_approval: boolean;
+  checks: SafetyCheck[];
+  resolved?: ResolvedTargets | null;
+}
+
 export interface Job {
   id: string;
   kind: string;
   state: string;
   target_mode: TargetMode;
   parameters: Record<string, unknown>;
+  resources: Array<{ resource_id: string; resource_type: string; mode: string }>;
   requested_by: string;
+  resolved_targets?: ResolvedTargets | null;
   progress: number;
   message: string;
   result: Record<string, unknown>;
@@ -64,6 +98,9 @@ export interface Device {
   name: string;
   stable_fingerprint: string;
   transient_path?: string | null;
+  stable_path?: string | null;
+  matched_profile_id?: string | null;
+  matched_role?: string;
   vendor?: string | null;
   product?: string | null;
   serial_number?: string | null;
@@ -78,34 +115,136 @@ export interface Robot {
   product_sku: string;
   robot_type: string;
   serial_number?: string | null;
+  device_fingerprint?: string | null;
+  port?: string | null;
+  calibration_id?: string | null;
   calibration_revision?: string | null;
+  motor_layout: Record<string, number>;
   camera_mapping: Record<string, string>;
+  safety_profile: Record<string, unknown>;
+  supported_features: string[];
   calibration_verified: boolean;
   joint_limits_verified: boolean;
   emergency_stop_ready: boolean;
   target_mode: TargetMode;
 }
 
+export interface Teleoperator {
+  id: string;
+  name: string;
+  product_sku: string;
+  teleoperator_type: string;
+  serial_number?: string | null;
+  device_fingerprint?: string | null;
+  port?: string | null;
+  calibration_id?: string | null;
+  calibration_revision?: string | null;
+  target_robot_types: string[];
+  target_mode: TargetMode;
+}
+
+export interface CalibrationArtifact {
+  id: string;
+  role: string;
+  device_type: string;
+  device_id: string;
+  source: string;
+  checksum: string;
+  live_path: string;
+  motors: Record<string, Record<string, number>>;
+  validation_result: { valid?: boolean; motor_count?: number; problems?: string[] };
+  supersedes?: string | null;
+  created_at: string;
+}
+
+export interface SafetyStatus {
+  emergency_stop_engaged: boolean;
+  physical_enabled: boolean;
+  max_relative_target_ceiling: number;
+  runtime_available: boolean;
+}
+
+export interface CommandPreview {
+  executable: string;
+  arguments: string[];
+  required_parameters: string[];
+  description: string;
+  requires_actuation: boolean;
+  interactive: boolean;
+  uses_shell: boolean;
+  environment: Record<string, string>;
+  runtime_available: boolean;
+  physical_enabled: boolean;
+  execution_allowed: boolean;
+  preflight: PreflightResult;
+}
+
+export interface TelemetrySample {
+  kind: string;
+  at: string;
+  loop_ms?: number | null;
+  hz?: number | null;
+  joints: Record<string, number>;
+  ranges: Record<string, { min: number; pos: number; max: number }>;
+  prompt?: string | null;
+  expects?: string | null;
+  episode?: number | null;
+  phase?: string | null;
+  message?: string | null;
+}
+
+export interface TelemetrySummary {
+  samples: number;
+  p50_loop_ms?: number | null;
+  p95_loop_ms?: number | null;
+  joints: Record<string, number>;
+  ranges: Record<string, { min: number; pos: number; max: number }>;
+  prompt?: TelemetrySample | null;
+  episode?: TelemetrySample | null;
+}
+
+export interface JobSnapshot {
+  type: string;
+  jobs: Job[];
+  leases: Array<{ resource_id: string; resource_type: string; owner_job_id: string; mode: string }>;
+  telemetry: Record<string, TelemetrySummary>;
+}
+
 export interface Camera {
   id: string;
   name: string;
+  device_fingerprint: string;
   backend: string;
   semantic_name: string;
   width: number;
   height: number;
   fps: number;
+  supports_depth: boolean;
+  orientation_degrees: number;
   latency_baseline_ms?: number | null;
 }
 
 export interface Dataset {
   id: string;
   name: string;
+  repo_id?: string | null;
+  local_path?: string | null;
   task: string;
+  calibration_revision?: string | null;
   features: string[];
   camera_mapping: Record<string, string>;
   fps: number;
   episodes: number;
+  total_frames: number;
+  codebase_version?: string | null;
+  robot_type?: string | null;
+  action_shape: number[];
   integrity_status: string;
+  integrity_report?: { problems?: string[]; files?: Record<string, unknown> } | null;
+  // Where the recording came from -- see PROVENANCE. Free-form on purpose: the
+  // backend writes whatever the producing job knew, and a dataset recorded
+  // before provenance existed carries an empty object rather than a source.
+  provenance: Record<string, unknown>;
   created_at: string;
 }
 
@@ -114,9 +253,13 @@ export interface Policy {
   name: string;
   policy_type: string;
   checkpoint?: string | null;
+  checkpoint_step?: number | null;
   source_dataset_id?: string | null;
+  source_repo_id?: string | null;
   expected_features: string[];
   action_shape: number[];
+  runtime: string;
+  training_steps?: number | null;
   compatibility_status: string;
   created_at: string;
 }
@@ -154,15 +297,109 @@ export interface HilChecklist {
   checks: Array<{ id: string; label: string; status: string }>;
 }
 
+export interface MotorReading {
+  motor_id: number;
+  name: string;
+  responded: boolean;
+  model_number?: number | null;
+  position?: number | null;
+  volts?: number | null;
+  torque_enabled?: boolean | null;
+}
+
+/** What an arm answered when we actually talked to it, not what USB claims. */
+export interface DeviceIdentification {
+  id: string;
+  device_fingerprint?: string | null;
+  port: string;
+  baudrate: number;
+  motors_expected: number;
+  motors_found: number;
+  bus_volts?: number | null;
+  suggested_role: string;
+  confidence: string;
+  reason: string;
+  motor_ids_match: boolean;
+  torque_engaged: boolean;
+  readings: MotorReading[];
+}
+
+export type SetupStepState = "done" | "ready" | "blocked" | "not_applicable";
+
+export interface SetupStep {
+  id: string;
+  label: string;
+  state: SetupStepState;
+  summary: string;
+  detail: string;
+  evidence: Record<string, unknown>;
+  blockers: string[];
+  next_action?: string | null;
+}
+
+export interface SetupSlot {
+  role: string;
+  label: string;
+  profile_id?: string | null;
+  profile_name?: string | null;
+  device_fingerprint?: string | null;
+  device_serial?: string | null;
+  port?: string | null;
+  lerobot_id?: string | null;
+  connected: boolean;
+  calibration_revision?: string | null;
+  calibration_source?: string | null;
+  calibration_valid?: boolean | null;
+  calibration_warnings: string[];
+  motor_count: number;
+}
+
+export interface SetupStatus {
+  commissioned: boolean;
+  physical_enabled: boolean;
+  slots: SetupSlot[];
+  steps: SetupStep[];
+  unassigned_devices: Device[];
+}
+
 const API_ROOT = "/api";
 
+let sessionToken: string | null = null;
+let sessionRequest: Promise<string> | null = null;
+
+/**
+ * The control plane hands out a per-run token so a page on another origin
+ * cannot drive the robot. It also lands in a SameSite cookie, which is what
+ * the MJPEG <img> and the event socket rely on.
+ */
+async function ensureSession(): Promise<string> {
+  if (sessionToken) return sessionToken;
+  sessionRequest ??= fetch(`${API_ROOT}/session`, { credentials: "same-origin" })
+    .then((response) => {
+      if (!response.ok) throw new Error("Oturum alınamadı");
+      return response.json() as Promise<{ token: string }>;
+    })
+    .then((payload) => {
+      sessionToken = payload.token;
+      return payload.token;
+    })
+    .catch((error) => {
+      sessionRequest = null;
+      throw error;
+    });
+  return sessionRequest;
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const token = await ensureSession();
   const response = await fetch(`${API_ROOT}${path}`, {
+    credentials: "same-origin",
+    ...options,
     headers: {
       "Content-Type": "application/json",
+      "X-Hashtag-Token": token,
       ...options?.headers,
     },
-    ...options,
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
@@ -178,4 +415,163 @@ export const api = {
       method: "POST",
       body: body === undefined ? undefined : JSON.stringify(body),
     }),
+  del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
 };
+
+/**
+ * Live job and telemetry feed. The socket reconnects on its own so a control
+ * plane restart does not leave the dashboard showing a frozen arm.
+ */
+export function subscribeEvents(
+  onSnapshot: (snapshot: JobSnapshot) => void,
+  onConnectionChange?: (connected: boolean) => void,
+): () => void {
+  let socket: WebSocket | null = null;
+  let retryTimer: number | undefined;
+  let disposed = false;
+
+  const connect = () => {
+    if (disposed) return;
+    const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+    // The handshake carries the SameSite cookie set by /api/session.
+    socket = new WebSocket(`${scheme}//${window.location.host}${API_ROOT}/events`);
+    socket.onopen = () => onConnectionChange?.(true);
+    socket.onmessage = (event) => {
+      try {
+        onSnapshot(JSON.parse(event.data as string) as JobSnapshot);
+      } catch {
+        // A malformed frame must never take the dashboard down.
+      }
+    };
+    socket.onclose = () => {
+      socket = null;
+      onConnectionChange?.(false);
+      if (!disposed) retryTimer = window.setTimeout(connect, 1500);
+    };
+    socket.onerror = () => socket?.close();
+  };
+
+  connect();
+  return () => {
+    disposed = true;
+    if (retryTimer) window.clearTimeout(retryTimer);
+    socket?.close();
+  };
+}
+
+/** What the simulation can do on this machine: installed is not the same as renderable. */
+export interface SimulationBackends {
+  mujoco_installed: boolean;
+  mujoco_renderable: boolean;
+  supported: string[];
+  models: string[];
+  /** The mesh-accurate arm is found on disk, not shipped, so this is per-machine. */
+  so101_model_available: boolean;
+  so101_model_path: string | null;
+  /** A window needs a desktop session; the browser stream does not. */
+  viewer_available: boolean;
+}
+
+/** Whether one policy can be trained on a set of recordings at once. */
+export interface DatasetComparison {
+  status: "compatible" | "warnings" | "incompatible";
+  summary: string;
+  datasets: Array<{ id: string; name: string }>;
+  blockers: Array<{ key: string; reason: string; values: Record<string, unknown> }>;
+  warnings: Array<{ key: string; reason: string; values: Record<string, unknown> }>;
+  profiles: Array<Record<string, unknown>>;
+  total_episodes?: number;
+  total_frames?: number;
+}
+
+/** One thing an agent may do here, described well enough to do it correctly. */
+export interface AgentAction {
+  action: string;
+  summary: string;
+  job_kind?: string | null;
+  target_modes?: string[];
+  parameters?: Record<string, string>;
+  /** Keys the job blocks without, whatever mode it runs in. */
+  required?: string[];
+  creates_job: boolean;
+  needs_human_approval: boolean;
+  roles: string[];
+  note?: string;
+  returns?: string;
+}
+
+/** One step of a plan, with what the server says about it beside what it did. */
+export interface AgentStepResult {
+  index: number;
+  action: string;
+  /** planned | completed | blocked | failed | awaiting_human | skipped */
+  state: string;
+  message: string;
+  command_result?: { accepted: boolean; message: string; data?: Record<string, unknown> } | null;
+  brief?: AgentAction;
+  warnings: string[];
+}
+
+export interface AgentPlanResult {
+  plan: {
+    steps: { action: string; rationale: string; parameters: Record<string, unknown> }[];
+    rationale: string;
+    risks: string[];
+    requires_confirmation: boolean;
+  };
+  executed: boolean;
+  steps: AgentStepResult[];
+  /** Why the run stopped short. Stopping at an approval step is the normal case. */
+  stopped_because: string | null;
+  warnings: string[];
+}
+
+/** One exchange, kept server-side so a reload does not lose the conversation. */
+export interface AgentTurn {
+  id: string;
+  session_id: string;
+  prompt: string;
+  result: AgentPlanResult;
+}
+
+/** Whether a planning model is configured, and what is missing when it is not. */
+export interface PlannerStatus {
+  installed: boolean;
+  model_configured: boolean;
+  /** The setting as written, provider prefix and all: `ollama:llama3.2:3b`. */
+  model: string | null;
+  /** What that setting resolved to. A bare model id means Bedrock, which is
+      worth saying out loud before an operator learns it from an auth error. */
+  provider: string | null;
+  model_id: string | null;
+  host: string | null;
+  ready: boolean;
+  blocked_by: string | null;
+  execution_boundary: string;
+  raw_robot_tools_exposed: boolean;
+}
+
+/** One take inside a recording, with the number that identifies a dead one. */
+export interface DatasetEpisode {
+  index: number;
+  frames: number;
+  task: string;
+  action_range?: number | null;
+  state_range?: number | null;
+  demonstrates_nothing: boolean;
+  /** Joints that held still for the whole take, by name. Not a fault by
+   *  itself -- a task may not use the wrist -- but an episode of a grasping
+   *  task where the gripper never moved is an episode where nothing was
+   *  grasped. */
+  still_joints?: string[];
+  /** Index of the earlier episode this one is a copy of, when a merge brought
+   *  the same recording in twice. Null for the first occurrence. */
+  duplicate_of?: number | null;
+}
+
+export interface DatasetEpisodes {
+  dataset_id: string;
+  episodes: DatasetEpisode[];
+  readable: boolean;
+  note: string;
+}

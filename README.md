@@ -143,19 +143,46 @@ Strands modeli hiçbir raw serial, shell veya servo tool görmez. Yalnızca
 structured plan üretir; plan rol izinlerinden geçer ve gerçek execution
 Hashtag Agent Gateway tarafından yapılır.
 
+## Yerel erişim koruması
+
+Control plane loopback'te dinler ve üç bağımsız kapı uygular:
+
+- **Host allowlist** — kendi alan adını `127.0.0.1`'e çözen bir sayfa (DNS
+  rebinding) yine kendi Host başlığını gönderir ve reddedilir.
+- **Origin allowlist** — başka bir sitenin isteği reddedilir.
+- **Oturum token'ı** — koşum başına üretilir, `GET /api/session` ile dashboard'a
+  verilir; `/api/health` dışındaki bütün uçlar ve event soketi bunu ister.
+
+`HASHTAG_ENABLE_PHYSICAL=true` iken loopback dışı bir adrese bind **reddedilir**.
+Başka bir makineden erişmek için SSH tüneli kullanın:
+
+```bash
+ssh -L 8770:127.0.0.1:8770 kullanici@makine
+```
+
+E-stop mandalı kalıcıdır ve yeniden başlatmayı aşar. Panel açılmıyorsa:
+
+```bash
+hashtag-robotics clear-estop
+```
+
 ## Fiziksel test
 
 Robotları bağlamadan önce:
 
 1. [HIL Test Planı](docs/HIL_TEST_PLANI_TR.md) tamamen okunmalı.
-2. `hashtag-robotics doctor` blocked sonuç vermemeli.
-3. Leader/follower port ve kimlikleri read-only çözülmeli.
-4. Fabrika/kullanıcı calibration backup alınmalı.
-5. E-stop yolu robot enerjilenmeden doğrulanmalı.
-6. İlk hareket calibration değil, düşük limitli kısa teleop preflight olmalı.
+2. Kullanıcı `dialout` grubunda olmalı (`sudo usermod -aG dialout <kullanıcı>`,
+   sonra oturum yenilenmeli; yenilenmediyse komutlar `sg dialout -c '...'` ile
+   sarılmalı).
+3. `hashtag-robotics doctor` blocked sonuç vermemeli.
+4. Leader/follower port ve kimlikleri read-only çözülmeli.
+5. Mevcut calibration `hashtag-robotics import-calibration <dizin>` ile içe
+   aktarılmalı; kalibrasyon işi zaten başlamadan önce yedek alır.
+6. E-stop yolu robot enerjilenmeden doğrulanmalı.
+7. İlk hareket calibration değil, düşük limitli kısa teleop preflight olmalı.
 
 `HASHTAG_ENABLE_PHYSICAL=true` yalnız fiziksel test oturumunda ve kullanıcı
-hazırken açılacaktır. Şu anda açılmamalıdır.
+hazırken açılır.
 
 ## Dokümanlar
 

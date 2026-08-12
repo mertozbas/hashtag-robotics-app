@@ -1,8 +1,30 @@
 # Uygulama Durumu
 
 **Sürüm:** `0.1.0`
-**Anlık görüntü:** 23 Temmuz 2026
-**Durum:** Software-only baseline tamamlandı; fiziksel HIL testleri bekleniyor
+**Anlık görüntü:** 30 Temmuz 2026
+**Durum:** Fiziksel yol uçtan uca yazıldı ve sahte donanımla doğrulandı; gerçek
+SO-101 üzerinde HIL testleri bekleniyor
+
+## 0. 30 Temmuz 2026 turunda ne değişti
+
+23 Temmuz'daki software-only iskelet, gerçek donanıma bağlanabilir hâle getirildi:
+
+- **LeRobot 0.6 komut sözleşmesi düzeltildi.** Robot tipleri `so101_follower` /
+  `so101_leader`, record ve replay argümanları `--dataset.*` altında, rollout
+  süre/strateji sözleşmesiyle. Üretilen argv artık LeRobot'un kendi draccus
+  parser'ına verilerek test ediliyor.
+- **Fiziksel komutlar PTY üzerinden sürülüyor** (K-011); operatör tuşları
+  `POST /api/jobs/{id}/input` ile gönderiliyor, stdout'tan eklem tabloları,
+  kalibrasyon aralıkları ve loop zamanlaması ayrıştırılıyor.
+- **Hedefler sunucuda çözülüyor** (K-010); istemcinin gönderdiği port, cihaz adı
+  ve limit atılıyor, onay token'ı çözümlenmiş hedeflerin hash'ine de bağlanıyor.
+- **Kameralar `/dev/v4l/by-id` üzerinden** açılıyor, ölçülen FPS/gecikme
+  raporlanıyor, MJPEG önizleme exclusive lease altında akıyor.
+- **Uydurulan sonuçlar silindi** (K-012): dataset bütünlüğü diskten okunuyor,
+  policy manifest'i checkpoint dizininden çıkarılıyor, rollout başarısı
+  operatörün bölüm bazlı işaretlemesinden geliyor.
+- **Yerel güvenlik katmanı eklendi**: Host/Origin allowlist, koşum başına oturum
+  token'ı ve fiziksel modda loopback dışına bind reddi (K-013).
 
 ## 1. Sonuç
 
@@ -18,8 +40,9 @@ install/build
   → doctor/capability
   → persisted jobs
   → leases/approval/audit
-  → safe mock robot workflows
-  → dataset/training/policy
+  → sunucu tarafı hedef çözümlemesi
+  → PTY üzerinden gerçek LeRobot komutları
+  → diskten okunan dataset/policy artifact'leri
   → Strands planner boundary
   → MuJoCo contract simulation
   → LeRobot physical command adapter
@@ -40,14 +63,14 @@ gerçek leader/follower bağla
 
 ## 2. Faz durumu
 
-| Faz | Software-only durum | Fiziksel/harici doğrulama |
+| Faz | Donanımsız durum | Fiziksel/harici doğrulama |
 |---|---|---|
-| Faz 0 | Tamamlandı | Temiz OS matrisi genişletilecek |
-| Faz 1 | Mock + real LeRobot command contract hazır | Leader/follower/camera HIL bekliyor |
-| Faz 2 | Dataset/training/policy/evaluation pipeline hazır | Gerçek dataset ve training benchmark bekliyor |
+| Faz 0 | Tamamlandı; CI her push'ta koşuyor | Temiz OS matrisi genişletilecek |
+| Faz 1 | Kurulum sihirbazı, PTY, kalibrasyon, kamera ve teleop yolu yazıldı | Leader/follower/kamera HIL bekliyor (T1-T7) |
+| Faz 2 | Dataset/policy artifact'leri diskten okunuyor; başarı operatörden | Gerçek training benchmark'ı bekliyor |
 | Faz 3 | Deterministic gateway + optional Strands planner hazır | Model provider ve red-team oturumu bekliyor |
-| Faz 4 | MuJoCo contract sim + remote TLS contract hazır | Validated digital twin ve remote GPU bekliyor |
-| Faz 5 | Wheel, diagnostics, fleet-local ve update status hazır | Installer signing, cloud ve support operasyonu bekliyor |
+| Faz 4 | MuJoCo contract sim + remote TLS contract hazır | Validated digital twin ve uzak GPU bekliyor (T8) |
+| Faz 5 | Wheel, diagnostics, fleet-local, update status ve CI hazır | Installer signing, cloud ve support operasyonu bekliyor |
 
 ## 3. Çalışan backend yüzeyi
 
@@ -83,10 +106,14 @@ gerçek leader/follower bağla
 - `read_only`, `sim`, `real` target ayrımı
 - Physical mode environment gate
 - LeRobot executable doğrulaması
-- Calibration, joint limit ve E-stop preflight
-- Feature mapping gate
-- Parameters hash'e bağlı beş dakikalık approval
-- Confirmation öncesi ve sonrası yeniden preflight
+- Sunucu tarafı hedef çözümlemesi: profil, fingerprint→port, kalibrasyon
+  revizyonu/checksum, limit tavanı, action shape, kamera eşlemesi
+- İstemcinin verebileceği tek beyan `workspace_confirmed`
+- Parametre **ve** çözümlenmiş hedef hash'ine bağlı beş dakikalık approval
+- Confirmation öncesi ve sonrası yeniden preflight; hedef değişmişse
+  `targets_changed` ile blok
+- Kalıcı emergency-stop mandalı (yeniden başlatmayı aşar) + `clear-estop`
+- Kalibrasyon işinden önce zorunlu yedek; yedek başarısızsa iş başlamaz
 
 ## 4. Faz 1 robot yüzeyi
 
@@ -97,47 +124,46 @@ gerçek leader/follower bağla
 - Simulated SO-101 ve local compute inventory
 - Robot, camera ve calibration revision sözleşmeleri
 - Kamera semantic key modeli
-- Teleop/record/replay/calibration mock workflow
-- LeRobot CLI command preview
+- Kurulum sihirbazı: tara → rol/ad → motor setup → kalibrasyon → doğrula
+- Canlı MIN/POS/MAX aralık tablosu ve operatör tuşları
+- Sunucunun çalıştıracağı komutun önizlemesi (preflight'ıyla birlikte)
 - Shell kullanmadan LeRobot subprocess adapter
 - SIGINT → timeout → kill güvenli stop sırası
 - Output redaction
 
 ### Fiziksel test bekleyen
 
-- Feetech follower/leader kimlik eşleme
-- Gerçek kalibrasyon dosya import/export
-- OpenCV kamera discovery ve canlı preview
-- Gerçek loop telemetry
-- Torque/power durumu
-- Donanım E-stop yolu
+Aşağıdakilerin tamamı **yazıldı ve sahte donanımla doğrulandı**; eksik olan
+gerçek SO-101 üzerinde koşulmalarıdır:
+
+- Feetech follower/leader kimlik eşleme (çıkar-tak sonrası aynı profile çözülme)
+- Gerçek kalibrasyon sihirbazı ve canlı MIN/POS/MAX aralıkları
+- Kamera discovery, ölçülen FPS ve canlı preview
+- Gerçek teleop loop telemetrisi
+- Torque/power durumu — henüz hiç okunmuyor, ürün yüzeyinde yok
+- Donanım E-stop yolu — şu an yalnız UI düğmesi ve ESC tuşu var
 
 ## 5. Faz 2 data/policy yüzeyi
 
 ### Hazır
 
-- DatasetManifest
-- Recording sonucunda immutable provenance
-- Dataset validation job
-- Training job
-- PolicyManifest
-- Action shape ve camera mapping
-- Evaluation sonucu:
-  - episodes
-  - successes/failures
-  - success rate
-  - p50/p95 latency
-- `lerobot-train` typed command builder
+- `meta/info.json` ve yanındaki dosyalardan okunan DatasetManifest
+  (bölüm, kare, fps, robot tipi, feature sözleşmesi, action shape)
+- Dört seviyeli bütünlük: `verified` / `incomplete` / `missing` / `unsupported`,
+  her biri gerekçesiyle
+- Diski yeniden okuyan dataset validation job'ı
+- Checkpoint dizininden çıkarılan PolicyManifest (adım, policy tipi, kaynak repo,
+  feature sözleşmesi); ağırlık yoksa policy kaydedilmez
+- Operatörün bölüm bazlı işaretlemesinden hesaplanan başarı oranı
+- `lerobot-train` typed command builder ve dataset'siz eğitimi engelleyen gate
 
 ### Gerçek benchmark bekleyen
 
-- Mevcut gerçek LeRobotDataset v3 import
-- Video/frame integrity
 - Hub push/pull
-- ACT gerçek training
+- ACT gerçek training (yerel CUDA yok; Orin'de T8)
 - MPS/CUDA kaynak ölçümü
-- Gerçek policy processor extraction
-- Rollout video ve manual outcome annotation
+- Processor chain'in checkpoint'ten tam çıkarımı
+- Rollout videosu
 
 ## 6. Faz 3 agent yüzeyi
 
@@ -194,6 +220,8 @@ gerçek robot üzerinden tanımlanmamıştır.
 - `hashtag-robotics` CLI
 - `doctor`
 - `capabilities`
+- `import-calibration`
+- `clear-estop`
 - `hil-checklist`
 - Diagnostics API
 - Local fleet view
@@ -212,68 +240,89 @@ gerçek robot üzerinden tanımlanmamıştır.
 
 ## 9. Test sonucu
 
-Software-only test paketi:
+Donanımsız test paketi (30 Temmuz 2026'da **116 test geçti**):
 
-- API ve seed
-- Read-only discovery
-- Simulation job
-- Real teleop HIL öncesi block
-- Recording → dataset
-- Dataset validation
-- Training → policy
-- Policy evaluation
-- Agent role denial
-- Deterministic agent job
-- Strands model configuration gate
-- Remote TLS rejection
-- Emergency stop
-- Exclusive/shared resource lease
-- Expired lease cleanup
-- LeRobot command contract
-- MuJoCo joint-limit contract
+- API, seed, read-only discovery, lease semantiği, audit
+- LeRobot argv sözleşmesi — LeRobot'un kendi draccus parser'ıyla doğrulanır
+- PTY süreç omurgası: ENTER teslimi, ok tuşları, süreç grubu durdurma,
+  yeniden başlatma sonrası yetim temizliği, PID yeniden kullanımı
+- Kalibrasyon: checksum, yedek-önce kuralı, revizyon zinciri, geri yükleme
+- Sunucu tarafı safety: istemci beyanının geçmediği, port sızdırılamadığı,
+  kalibrasyon kayması, e-stop mandalı, ayrık leader/follower, kamera çözümlemesi
+- Bayat onay: kol başka porta düşünce `targets_changed`
+- Kamera: by-id çözümleme, ölçülen FPS/gecikme, MJPEG, exclusive lease
+- Dataset bütünlüğü ve checkpoint okuma (gerçek v3.0 düzeninden fixture)
+- Operatör annotation'ı ve yalnız bölümlü işlerin işaretlenebilmesi
+- Yerel güvenlik: token, Host/Origin allowlist, WebSocket, loopback kuralı
 
-Son doğrulamada bütün testler geçti. Güncel sayı değişebileceği için kesin sonuç
+Fiziksel yol, sahte pyserial katmanı ve sahte `lerobot-calibrate` ile uçtan uca
+sürülerek doğrulandı (`scripts/demo_fake_arm.py`). Kesin sonuç her zaman
 `bash scripts/verify.sh` çıktısından alınmalıdır.
 
 ## 10. Kod haritası
 
 ```text
 src/hashtag_robotics/
-├── api.py               API ve runtime composition
+├── api.py               API, runtime composition ve erişim koruması
 ├── models.py            Domain contract'ları
-├── repository.py        SQLite, jobs, leases, approvals, audit
-├── jobs.py              Job coordinator ve worker
-├── safety.py            Deterministic preflight
-├── workflows.py         Workflow engine
-├── hardware.py          LeRobot CLI adapter
+├── repository.py        SQLite, jobs, leases, approvals, flags, audit
+├── jobs.py              Job coordinator, approval, e-stop mandalı, annotation
+├── safety.py            Sunucu tarafı hedef çözümlemesi ve preflight
+├── security.py          Host/Origin allowlist ve oturum token'ı
+├── workflows.py         Workflow engine ve artifact toplama
+├── hardware.py          LeRobot CLI adapter (argüman dizisi, shell yok)
+├── process.py           PTY/pipe süreç yönetimi, süreç grubu, yetim temizliği
+├── telemetry.py         stdout ayrıştırma (loop, eklem, kalibrasyon aralığı)
+├── calibration.py       Kalibrasyon oku/arşivle/geri yükle/içe aktar
+├── camera.py            by-id kamera çözümleme, probe, MJPEG
+├── dataset.py           LeRobotDataset v3.0 metadata ve bütünlük
+├── policy.py            Checkpoint dizini okuma
 ├── simulation.py        MuJoCo contract adapter
 ├── agents.py            Deterministic agent gateway
 ├── strands_runtime.py   Optional structured Strands planner
 ├── doctor.py            Capability ve compatibility
-├── discovery.py         Read-only device discovery
+├── discovery.py         Read-only device discovery (serial + kamera)
 ├── seeding.py           Safe başlangıç profilleri
 └── web/                 Derlenmiş dashboard
 
 frontend/
-├── src/App.tsx
-├── src/api.ts
+├── src/App.tsx          10 görünüm: kurulum sihirbazı, operate, kamera stüdyosu…
+├── src/api.ts           REST istemcisi, oturum token'ı, event soketi
 └── src/styles.css
 
 tests/
-├── test_api.py
-├── test_hardware.py
-├── test_repository.py
-└── test_simulation.py
+├── test_api.py          API akışları ve annotation
+├── test_calibration.py  Kalibrasyon arşivi ve revizyon zinciri
+├── test_camera.py       Kamera çözümleme, probe, MJPEG, lease
+├── test_contracts.py    Argv'yi LeRobot'un kendi parser'ına verir
+├── test_dataset.py      Dataset bütünlüğü ve checkpoint okuma
+├── test_hardware.py     Komut kurucusu
+├── test_physical.py     PTY, onay, e-stop mandalı, bayat onay
+├── test_process.py      Süreç grubu ve yetim temizliği
+├── test_repository.py   Lease semantiği
+├── test_safety.py       Sunucu tarafı çözümleme ve red gerekçeleri
+├── test_security.py     Host/Origin/token ve loopback kuralı
+├── test_simulation.py   MuJoCo joint limit sözleşmesi
+└── test_telemetry.py    stdout ayrıştırıcıları
+
+scripts/
+├── verify.sh            ruff + pytest + tsc + wheel
+└── build-package.sh     Frontend build'ini wheel'e gömer
+
+.github/workflows/ci.yml  Hızlı `software` işi + ağır `lerobot-contract` işi
 ```
 
 ## 11. Doğru sonraki adım
 
-Yeni feature eklemek değil, [HIL Test Planı](HIL_TEST_PLANI_TR.md) ile:
+Yeni feature eklemek değil, [HIL Test Planı](HIL_TEST_PLANI_TR.md) T0→T8 sırasını
+gerçek kolla koşmaktır. Ön koşullar:
 
-1. read-only port/camera discovery,
-2. leader/follower identity,
-3. calibration artifact,
-4. emergency stop,
-5. düşük limitli teleop
+```bash
+sudo usermod -aG dialout <kullanıcı>     # sonra oturumu yenile
+ls -l /dev/serial/by-id/                 # iki kol görünmeli
+HASHTAG_ENABLE_PHYSICAL=true uv run hashtag-robotics serve
+```
 
-doğrulamasına geçmektir.
+Oturum yenilenmediyse seri porta dokunan komutlar `sg dialout -c '...'` ile
+sarılmalıdır. Sıra: T1/T2 kimlik → T3 kalibrasyon → T5/T6 e-stop ve düşük
+limitli teleop → T4/T7 kamera ve tek bölüm kayıt/replay → T8 rollout (Orin).

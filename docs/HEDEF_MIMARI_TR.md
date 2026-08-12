@@ -301,10 +301,13 @@ created
   → completed
   → failed
   → aborted
+  → interrupted
 ```
 
 Kurallar:
 
+- `interrupted`, uygulama yeniden başladığında yarım kalan işin aldığı durumdur;
+  lease'leri bırakılır ve süreç grubu temizlenir.
 - `blocked`, eksik veya uyumsuz koşulu açık bir kodla taşır.
 - Fiziksel actuation işi confirmation olmadan `queued` olamaz.
 - Job yeniden başlatıldığında önce eski lease ve process doğrulanır.
@@ -327,6 +330,7 @@ Job türleri:
 - `evaluation`
 - `policy_rollout`
 - `simulation`
+- `remote_inference_probe`
 - `hub_sync`
 - `diagnostics`
 
@@ -444,11 +448,14 @@ list_devices
 inspect_robot
 inspect_calibration
 inspect_cameras
-inspect_dataset
-inspect_policy
+inspect_datasets
+inspect_policies
 inspect_jobs
 analyze_diagnostics
 ```
+
+Tool adlarında kanonik kaynak [Workflow Kataloğu](WORKFLOW_KATALOGU_TR.md) §5'tir;
+kod o adları uygular.
 
 ### Hazırlık ve planlama
 
@@ -477,8 +484,8 @@ sync_hub_artifact
 request_calibration_execution
 request_teleoperation
 request_replay
-request_real_rollout
-stop_robot
+request_rollout
+stop_job
 ```
 
 Tool çağrısı fiziksel action göndermez; command oluşturur, doğrular ve gerekiyorsa

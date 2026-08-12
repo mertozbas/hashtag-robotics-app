@@ -1,6 +1,6 @@
 # Ürün Kararları ve Risk Kaydı
 
-**Son güncelleme:** 23 Temmuz 2026
+**Son güncelleme:** 30 Temmuz 2026
 **Amaç:** Onaylanmış yönü, açık kararları ve önemli teknik/ürün risklerini tek
 yerde tutmak.
 
@@ -60,6 +60,62 @@ olacak.
 
 **Karar:** Calibration, teleop, recording, training ve rollout gibi süreçler
 process içi global state değil kalıcı Job olarak yönetilecek.
+
+### K-010 — Fiziksel hedefleri yalnız sunucu çözer
+
+**Karar:** İstemci port, cihaz adı, kalibrasyon revizyonu veya hareket limiti
+gönderemez. Bu değerler `robot_profile_id`'den sunucuda çözülür, istemcinin
+gönderdiği kopyalar komut kurulmadan önce atılır. İstemcinin verebileceği tek
+karar `workspace_confirmed`'dır.
+
+**Gerekçe:** Preflight istemcinin `"calibration_verified": true` gibi
+beyanlarına bakarken POST atabilen herkes rastgele bir cihaza hareket yetkisi
+verebiliyordu. Onay token'ı artık parametre hash'ine ek olarak çözümlenmiş
+hedeflerin hash'ine de bağlıdır; kol onayla başlatma arasında başka porta
+düşerse iş `targets_changed` ile bloklanır.
+
+### K-011 — Fiziksel komutlar PTY üzerinden sürülür
+
+**Karar:** LeRobot alt süreçleri pipe değil pseudo-terminal üzerinden çalıştırılır;
+operatör tuşları `POST /api/jobs/{id}/input` ile gönderilir.
+
+**Gerekçe:** `lerobot-calibrate` ve `lerobot-setup-motors` `input()` ile ENTER
+bekler (pipe'ta `EOFError`), `lerobot-record` ise `sys.stdin.isatty()` yanlışsa
+bölüm kontrolünü sessizce devre dışı bırakır. Wayland oturumunda global klavye
+yakalanamadığı için PTY tek çalışan yoldur.
+
+### K-012 — Ölçülmeyen sayı raporlanmaz
+
+**Karar:** Dataset bölüm/kare sayıları `meta/info.json` ve yanındaki dosyalardan
+okunur; policy manifest'i checkpoint dizininden çıkarılır; rollout başarısı
+operatörün bölüm bazlı işaretlemesinden gelir. Hiçbiri iş parametrelerinden
+türetilmez veya uydurulmaz.
+
+**Gerekçe:** Eski akış tek kare yazmadan dataset'i `verified` işaretliyor ve
+`successes = episodes - 1` diye başarı üretiyordu. Bu sayılar bir satın alma
+veya eğitim kararına girerse zarar verir.
+
+### K-013 — Fiziksel control plane loopback'te kalır
+
+**Karar:** `HASHTAG_ENABLE_PHYSICAL=true` iken loopback dışı bir adrese bind
+reddedilir. Uzaktan erişim SSH tüneliyle yapılır.
+
+**Gerekçe:** Robotu hareket ettirebilen bir servisin LAN'a açılması, yerel
+güvenlik katmanının (Host/Origin allowlist + oturum token'ı) varsaydığı tehdit
+modelinin dışına çıkar.
+
+### K-014 — HIL T1-T7 laptopta, rollout Orin'de
+
+**Karar:** Kurulum, kimlik, kalibrasyon, kamera, teleop ve kayıt (HIL T1-T7)
+Ubuntu laptopta koşulur. Yalnız gerçek policy rollout (T8) Jetson Orin Nano'da
+çalışır; oraya SSH tüneliyle bağlanılır (`ssh -L 8770:127.0.0.1:8770 ...`,
+Orin'de 8765 doludur).
+
+**Gerekçe:** Teleop, motor setup, kalibrasyon, kamera ve dataset kaydı GPU
+istemez — yalnız USB seri port ve kamera ister. Orin'in çalışan ortamı
+Python 3.10 + LeRobot 0.4.4'tür ve bu uygulama 3.12 + LeRobot 0.6 ister;
+Orin'i yükseltmek JetPack 6.2 için py3.12 torch wheel'i bulmayı gerektirir ve
+çalışan SmolVLA servisini riske atar.
 
 ## 2. Açık kararlar ve geçici varsayımlar
 

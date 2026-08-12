@@ -86,6 +86,12 @@ class Repository:
                     payload TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS flags (
+                    name TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id TEXT PRIMARY KEY,
                     timestamp TEXT NOT NULL,
@@ -140,6 +146,31 @@ class Repository:
                 (kind, entity_id),
             )
             return cursor.rowcount > 0
+
+    def get_flag(self, name: str) -> str | None:
+        """Read a latched control-plane flag; it survives restarts by design."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM flags WHERE name = ?",
+                (name,),
+            ).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_flag(self, name: str, value: str | None) -> None:
+        with self._lock, self._connect() as connection:
+            if value is None:
+                connection.execute("DELETE FROM flags WHERE name = ?", (name,))
+                return
+            connection.execute(
+                """
+                INSERT INTO flags(name, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (name, value, utc_now().isoformat()),
+            )
 
     def create_job(self, job: JobRecord) -> JobRecord:
         with self._lock, self._connect() as connection:
@@ -198,6 +229,21 @@ class Repository:
                 self.release_leases(job.id)
                 recovered.append(job)
         return recovered
+
+    def lease_owner(self, resource_id: str) -> str | None:
+        """Who currently holds this resource, ignoring leases that have expired.
+
+        Expired rows are only swept when someone tries to acquire, so a caller
+        that merely asks must filter them out or it will report a device as busy
+        long after its holder is gone.
+        """
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT owner_job_id FROM leases WHERE resource_id = ? AND expires_at > ? "
+                "ORDER BY expires_at DESC LIMIT 1",
+                (resource_id, utc_now().isoformat()),
+            ).fetchone()
+        return str(row["owner_job_id"]) if row else None
 
     def acquire_leases(
         self,
