@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,7 @@ class Settings(BaseSettings):
     simulation_model_path: Path | None = None
     max_job_seconds: int = 900
     input_min_interval_ms: int = 120
+    default_max_relative_target: float = 10.0
     max_relative_target_ceiling: float = 30.0
     # A page that resolves its own domain to 127.0.0.1 would otherwise be
     # same-origin with this server, so the Host header is checked too.
@@ -60,6 +62,18 @@ class Settings(BaseSettings):
         than one simulated session at a time.
         """
         return self.data_dir / "sim-live.jpg"
+
+    @property
+    def recording_live_root(self) -> Path:
+        """Transient camera frames relayed by a physical recording process."""
+        return self.data_dir / "recording-live"
+
+    def recording_live_frame_path(self, job_id: str, camera_role: str) -> Path:
+        """Resolve one job-scoped relay frame without accepting path segments."""
+        safe = re.compile(r"^[A-Za-z0-9_-]+$")
+        if not safe.fullmatch(job_id) or not safe.fullmatch(camera_role):
+            raise ValueError("Recording live-frame identifiers contain unsafe characters.")
+        return self.recording_live_root / job_id / f"{camera_role}.jpg"
 
     @property
     def database_path(self) -> Path:
@@ -81,11 +95,17 @@ class Settings(BaseSettings):
     def calibration_archive_dir(self) -> Path:
         return self.data_dir / "calibration-archive"
 
+    @property
+    def policy_dir(self) -> Path:
+        """Pinned Hugging Face policy snapshots managed by the control plane."""
+        return self.data_dir / "policies"
+
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.diagnostics_dir.mkdir(parents=True, exist_ok=True)
         self.lerobot_home.mkdir(parents=True, exist_ok=True)
         self.calibration_archive_dir.mkdir(parents=True, exist_ok=True)
+        self.policy_dir.mkdir(parents=True, exist_ok=True)
 
 
 @lru_cache

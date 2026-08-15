@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from hashtag_robotics.hardware import (
     LeRobotCliAdapter,
     LeRobotCommandBuilder,
     PhysicalExecutionError,
+    execution_timeout_seconds,
 )
 from hashtag_robotics.models import (
     JobCreateRequest,
@@ -21,6 +23,10 @@ from hashtag_robotics.models import (
     TelemetrySample,
 )
 from hashtag_robotics.repository import Repository
+from hashtag_robotics.tic_tac_toe import (
+    TIC_TAC_TOE_PROFILE,
+    canonical_tic_tac_toe_parameters,
+)
 
 
 def real_request(kind: JobKind, **parameters: object) -> JobCreateRequest:
@@ -64,6 +70,74 @@ def test_teleoperation_command_is_an_argument_array_without_shell() -> None:
     assert plan.as_dict()["uses_shell"] is False
 
 
+def test_teleoperation_without_duration_runs_until_operator_cancel() -> None:
+    plan = LeRobotCommandBuilder().build(
+        real_request(
+            JobKind.TELEOPERATION,
+            robot_port="/dev/follower",
+            robot_id="follower",
+            teleop_port="/dev/leader",
+            teleop_id="leader",
+            fps=60,
+        )
+    )
+
+    assert "--fps=60" in plan.arguments
+    assert all(not argument.startswith("--teleop_time_s=") for argument in plan.arguments)
+
+
+def test_manual_teleoperation_has_no_server_watchdog_unless_explicit() -> None:
+    manual = JobRecord(
+        kind=JobKind.TELEOPERATION,
+        target_mode=TargetMode.REAL,
+        parameters={},
+        requested_by="test",
+    )
+    bounded = JobRecord(
+        kind=JobKind.TELEOPERATION,
+        target_mode=TargetMode.REAL,
+        parameters={"timeout_seconds": 45},
+        requested_by="test",
+    )
+    recording = JobRecord(
+        kind=JobKind.RECORDING,
+        target_mode=TargetMode.REAL,
+        parameters={},
+        requested_by="test",
+    )
+
+    assert execution_timeout_seconds(manual, 900) is None
+    assert execution_timeout_seconds(bounded, 900) == 45
+    assert execution_timeout_seconds(recording, 900) == 900
+
+
+def test_only_camera_jobs_receive_a_job_scoped_dashboard_relay(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, data_dir=tmp_path, open_browser=False)
+    adapter = LeRobotCliAdapter(settings, Repository(settings.database_path))
+    recording = JobRecord(
+        kind=JobKind.RECORDING,
+        target_mode=TargetMode.REAL,
+        parameters={},
+        requested_by="test",
+    )
+    teleoperation = JobRecord(
+        kind=JobKind.TELEOPERATION,
+        target_mode=TargetMode.REAL,
+        parameters={},
+        requested_by="test",
+    )
+
+    recording_environment = adapter.environment(recording)
+
+    assert recording_environment["HASHTAG_RECORDING_LIVE_DIR"] == str(
+        settings.recording_live_root / recording.id
+    )
+    assert recording_environment["HASHTAG_MANUAL_RECORDING_CONTROL"] == "1"
+    assert (settings.recording_live_root / recording.id).is_dir()
+    assert "HASHTAG_RECORDING_LIVE_DIR" not in adapter.environment(teleoperation)
+    assert "HASHTAG_MANUAL_RECORDING_CONTROL" not in adapter.environment(teleoperation)
+
+
 def test_recording_command_requires_repo_and_task() -> None:
     with pytest.raises(PhysicalExecutionError, match="repo_id"):
         LeRobotCommandBuilder().build(
@@ -104,6 +178,78 @@ def test_recording_arguments_are_nested_under_the_dataset_config() -> None:
     assert "--dataset.root=/tmp/hashtag/dataset" in plan.arguments
     assert all(not argument.startswith("--repo_id") for argument in plan.arguments)
     assert all(not argument.startswith("--num_episodes") for argument in plan.arguments)
+
+
+def test_unique_id_camera_recording_uses_the_registered_wrapper() -> None:
+    plan = LeRobotCommandBuilder().build(
+        real_request(
+            JobKind.RECORDING,
+            robot_port="/dev/follower",
+            robot_id="follower01",
+            teleop_port="/dev/leader",
+            teleop_id="leader01",
+            repo_id="local/two-cameras",
+            task="play tic tac toe",
+            cameras={
+                "wrist": {
+                    "type": "avfoundation_uid",
+                    "unique_id": "usb-wrist",
+                    "helper_path": "/tmp/capture",
+                    "width": 640,
+                    "height": 480,
+                    "fps": 30,
+                }
+            },
+        )
+    )
+
+    assert plan.executable == "hashtag-lerobot-record"
+    assert any("avfoundation_uid" in argument for argument in plan.arguments)
+
+
+def test_a_planned_recording_uses_one_task_per_episode(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, data_dir=tmp_path, open_browser=False)
+    adapter = LeRobotCliAdapter(settings, Repository(settings.database_path))
+    parameters = {
+        "robot_port": "/dev/follower",
+        "robot_id": "follower01",
+        "teleop_port": "/dev/leader",
+        "teleop_id": "leader01",
+        "repo_id": "hashtagrobotics/tic-tac-toe-so101",
+        "task": "first",
+        "episodes": 2,
+        "episode_tasks": ["first", "second"],
+    }
+    plan = adapter.builder.build(real_request(JobKind.RECORDING, **parameters))
+    job = JobRecord(
+        kind=JobKind.RECORDING,
+        target_mode=TargetMode.REAL,
+        parameters=parameters,
+        requested_by="test",
+    )
+
+    assert plan.executable == "hashtag-lerobot-record"
+    assert json.loads(adapter.environment(job)["HASHTAG_EPISODE_TASKS_JSON"]) == [
+        "first",
+        "second",
+    ]
+
+
+def test_a_planned_recording_rejects_a_task_count_mismatch() -> None:
+    with pytest.raises(PhysicalExecutionError, match="count must match"):
+        LeRobotCommandBuilder().build(
+            real_request(
+                JobKind.RECORDING,
+                robot_port="/dev/follower",
+                robot_id="follower01",
+                teleop_port="/dev/leader",
+                teleop_id="leader01",
+                repo_id="hashtagrobotics/tic-tac-toe-so101",
+                task="first",
+                episodes=2,
+                episode_tasks=["first"],
+            )
+        )
 
 
 def test_replay_arguments_are_nested_under_the_dataset_config() -> None:
@@ -200,6 +346,87 @@ def test_base_strategy_rollout_is_duration_bound_and_needs_no_dataset() -> None:
     # meets the calibration prompt, so it needs a terminal like the rest.
     assert plan.interactive is True
     assert all(not argument.startswith("--dataset.") for argument in plan.arguments)
+
+
+def test_tic_tac_toe_rollout_uses_the_bench_validated_recorded_contract(
+    tmp_path: Path,
+) -> None:
+    parameters = canonical_tic_tac_toe_parameters(
+        {
+            "rollout_profile": TIC_TAC_TOE_PROFILE,
+            "move_id": "X-7",
+            "device": "mps",
+        }
+    )
+    parameters.update(
+        {
+            "robot_port": "/dev/follower",
+            "robot_id": "denizli",
+            "robot_calibration_dir": "/tmp/calibration/robots/so_follower",
+            "max_relative_target": 5.0,
+            "policy_path": "/tmp/models/smolvla",
+            "cameras": {
+                "top": {"type": "opencv", "index_or_path": 0},
+                "wrist": {"type": "opencv", "index_or_path": 1},
+            },
+            "rename_map": {
+                "observation.images.top": "observation.images.camera1",
+                "observation.images.wrist": "observation.images.camera2",
+            },
+        }
+    )
+
+    settings = Settings(_env_file=None, data_dir=tmp_path, open_browser=False)
+    adapter = LeRobotCliAdapter(settings, Repository(settings.database_path))
+    plan = adapter.builder.build(real_request(JobKind.POLICY_ROLLOUT, **parameters))
+    job = JobRecord(
+        kind=JobKind.POLICY_ROLLOUT,
+        target_mode=TargetMode.REAL,
+        parameters=parameters,
+        requested_by="test",
+    )
+    environment = adapter.environment(job)
+
+    assert plan.executable == "hashtag-lerobot-rollout"
+    assert "--strategy.type=episodic" in plan.arguments
+    assert "--strategy.reset_to_initial_position=true" in plan.arguments
+    assert "--inference.type=rtc" in plan.arguments
+    assert "--inference.queue_threshold=18" in plan.arguments
+    assert "--inference.rtc.enabled=false" in plan.arguments
+    assert "--return_to_initial_position=true" in plan.arguments
+    assert "--robot.disable_torque_on_disconnect=true" in plan.arguments
+    assert "--robot.max_relative_target=5.0" in plan.arguments
+    assert "--dataset.num_episodes=1" in plan.arguments
+    assert "--dataset.episode_time_s=86400" in plan.arguments
+    assert "--dataset.video=true" in plan.arguments
+    assert all(not argument.startswith("--duration=") for argument in plan.arguments)
+    assert environment["HASHTAG_ASYNC_CHUNK_APPEND"] == "1"
+    assert environment["HASHTAG_UNBOUNDED_ROLLOUT"] == "1"
+    assert "episode_index" in environment["HASHTAG_TTT_DEMO_PRESET_JSON"]
+    assert "bottom left" in environment["HASHTAG_ROLLOUT_EPISODE_TASKS_JSON"]
+    assert execution_timeout_seconds(job, 900) is None
+
+
+def test_policy_rollout_passes_the_server_resolved_camera_rename_map() -> None:
+    plan = LeRobotCommandBuilder().build(
+        real_request(
+            JobKind.POLICY_ROLLOUT,
+            robot_port="/dev/follower",
+            robot_id="follower01",
+            policy_path="/tmp/models/smolvla",
+            strategy="base",
+            duration=20,
+            rename_map={
+                "observation.images.top": "observation.images.camera1",
+                "observation.images.wrist": "observation.images.camera2",
+            },
+        )
+    )
+
+    assert (
+        '--rename_map={"observation.images.top":"observation.images.camera1",'
+        '"observation.images.wrist":"observation.images.camera2"}'
+    ) in plan.arguments
 
 
 def test_teleoperator_calibration_does_not_require_robot_port() -> None:

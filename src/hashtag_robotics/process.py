@@ -10,15 +10,22 @@ import struct
 import termios
 from pathlib import Path
 
+import psutil
+
 from hashtag_robotics.models import JobInputKey, JobProcess
 
 KEY_BYTES: dict[JobInputKey, bytes] = {
     JobInputKey.ENTER: b"\r",
     JobInputKey.USE_EXISTING_CALIBRATION: b"\r",
     JobInputKey.RECALIBRATE: b"c\r",
-    JobInputKey.END_EPISODE: b"\x1b[C",
-    JobInputKey.RERECORD_EPISODE: b"\x1b[D",
-    JobInputKey.STOP_RECORDING: b"\x1b",
+    # LeRobot deliberately supports these one-byte aliases.  They are the
+    # reliable control-plane contract: an escape sequence can be split or a
+    # bare ESC can be swallowed while the listener waits to decide whether an
+    # arrow key follows.  The dashboard is not a physical keyboard, so it must
+    # not pretend to be one.
+    JobInputKey.END_EPISODE: b"n",
+    JobInputKey.RERECORD_EPISODE: b"r",
+    JobInputKey.STOP_RECORDING: b"q",
 }
 
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
@@ -34,18 +41,36 @@ def current_boot_id() -> str | None:
     try:
         return BOOT_ID_PATH.read_text().strip()
     except OSError:
-        return None
+        # Darwin has no /proc boot UUID.  A stable boot epoch still separates
+        # a stale PID from one created after a reboot, which is the safety
+        # property the persisted process record needs.
+        try:
+            return f"boot-epoch-{int(psutil.boot_time())}"
+        except (OSError, RuntimeError):
+            return None
+
+
+def _process_argv(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        try:
+            return psutil.Process(pid).cmdline()
+        except (psutil.Error, OSError):
+            return []
+    return [part for part in raw.decode(errors="replace").split("\0") if part]
 
 
 def process_matches(record: JobProcess) -> bool:
-    try:
-        raw = Path(f"/proc/{record.pid}/cmdline").read_bytes()
-    except OSError:
-        return False
-    argv = [part for part in raw.decode(errors="replace").split("\0") if part]
+    argv = _process_argv(record.pid)
     if not argv:
         return False
-    return Path(argv[0]).name == Path(record.executable).name
+    expected = Path(record.executable).name
+    # Console scripts use a Python shebang, so process metadata can expose
+    # either the script itself or ``python <script>``.  Only the executable and
+    # its possible interpreter slot are considered; arbitrary arguments must
+    # never be allowed to turn a reused PID into a match.
+    return any(Path(candidate).name == expected for candidate in argv[:2])
 
 
 async def terminate_group(pgid: int, grace_seconds: float = 5.0) -> str:

@@ -21,6 +21,11 @@ from hashtag_robotics.models import (
 from hashtag_robotics.process import reap_orphan
 from hashtag_robotics.repository import Repository, ResourceBusyError
 from hashtag_robotics.safety import SafetyService, parameter_hash
+from hashtag_robotics.tic_tac_toe import (
+    TicTacToePresetError,
+    canonical_tic_tac_toe_parameters,
+    is_tic_tac_toe_parameters,
+)
 from hashtag_robotics.workflows import WorkflowCancelled, WorkflowEngine
 
 TERMINAL_STATES = {
@@ -107,6 +112,16 @@ def apply_server_defaults(
     make that promise false in exactly the case it matters -- the operator reads
     the command, sees no camera flag, and gets one anyway.
     """
+    if request.kind == JobKind.POLICY_ROLLOUT and is_tic_tac_toe_parameters(request.parameters):
+        try:
+            parameters = canonical_tic_tac_toe_parameters(request.parameters)
+        except TicTacToePresetError:
+            # Preflight owns user-facing validation. Keeping the invalid move in
+            # the request lets it produce a blocked check instead of turning a
+            # preview or job submission into an unhandled server error.
+            return request
+        return request.model_copy(update={"parameters": parameters})
+
     if request.kind != JobKind.SIM_RECORDING or request.parameters.get("cameras"):
         return request
     mapped = [
@@ -329,10 +344,25 @@ class JobCoordinator:
             raise ValueError("Operator input is arriving faster than the safe interval.")
         self._last_input[job_id] = now
 
+        previous_control = self.hardware.latest_control_ack(job_id)
         try:
             self.hardware.send_input(job_id, key)
         except PhysicalExecutionError as error:
             raise ValueError(str(error)) from error
+
+        if key in EPISODE_KEYS:
+            acknowledged = await self.hardware.wait_for_control_ack(
+                job_id,
+                key,
+                str(previous_control.get("at")) if previous_control else None,
+            )
+            if acknowledged is None:
+                self._audit(job, "job.input_unacknowledged", key.value, actor=actor)
+                raise ValueError(
+                    f"'{key.value}' recorder kanalına iletildi ancak recorder 2 saniye "
+                    "içinde uyguladığını doğrulamadı. Körlemesine tekrar göndermeyin; "
+                    "kayıt durumunu kontrol edin."
+                )
         self._audit(job, "job.input", key.value, actor=actor)
         return job
 

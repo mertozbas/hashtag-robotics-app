@@ -50,6 +50,73 @@ def test_health_summary_and_seeded_profiles(client: TestClient) -> None:
     assert robots[0]["calibration_verified"] is True
 
 
+def test_tic_tac_toe_rollout_catalogue_is_complete_and_server_owned(
+    client: TestClient,
+) -> None:
+    response = client.get("/api/policy-rollouts/tic-tac-toe")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["profile"] == "tic_tac_toe_80k"
+    assert len(payload["moves"]) == 18
+    x7 = next(move for move in payload["moves"] if move["id"] == "X-7")
+    assert x7["episode_index"] == 45
+    assert x7["board_camera"] == ".../OXO/..."
+
+
+def test_frontend_shell_is_never_reused_after_a_dashboard_rebuild(
+    client: TestClient,
+) -> None:
+    root = client.get("/")
+    fallback = client.get("/collect")
+
+    assert root.status_code == 200
+    assert fallback.status_code == 200
+    assert root.headers["cache-control"] == "no-store"
+    assert fallback.headers["cache-control"] == "no-store"
+
+
+def test_physical_gate_requires_confirmation_and_is_process_scoped(client: TestClient) -> None:
+    refused = client.post(
+        "/api/safety/physical-gate",
+        json={"enabled": True, "confirmed": False},
+    )
+    assert refused.status_code == 409
+    assert client.get("/api/summary").json()["physical_enabled"] is False
+
+    opened = client.post(
+        "/api/safety/physical-gate",
+        json={"enabled": True, "confirmed": True},
+    )
+    assert opened.status_code == 200
+    assert opened.json()["physical_enabled"] is True
+    assert client.get("/api/summary").json()["physical_enabled"] is True
+    assert client.get("/api/health").json()["mode"] == "hil"
+
+    closed = client.post(
+        "/api/safety/physical-gate",
+        json={"enabled": False, "confirmed": False},
+    )
+    assert closed.status_code == 200
+    assert closed.json()["physical_enabled"] is False
+
+    events = client.get("/api/audit").json()
+    gate_events = [event for event in events if event["action"] == "safety.physical_gate"]
+    assert [event["outcome"] for event in gate_events[:2]] == ["disabled", "enabled"]
+
+
+def test_physical_gate_cannot_open_while_estop_is_latched(client: TestClient) -> None:
+    client.post("/api/safety/emergency-stop")
+
+    response = client.post(
+        "/api/safety/physical-gate",
+        json={"enabled": True, "confirmed": True},
+    )
+
+    assert response.status_code == 409
+    assert "E-STOP" in response.json()["detail"]
+
+
 def test_read_only_discovery_persists_safe_simulated_devices(client: TestClient) -> None:
     response = client.post("/api/devices/discover?include_simulated=true")
     assert response.status_code == 200

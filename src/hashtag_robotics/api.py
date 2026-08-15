@@ -5,7 +5,7 @@ import os
 import shutil
 import time
 from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -66,6 +66,7 @@ from hashtag_robotics.models import (
     JobKind,
     JobRecord,
     JobState,
+    PhysicalGateRequest,
     PolicyManifest,
     RemoteEndpoint,
     ResourceRequest,
@@ -79,6 +80,12 @@ from hashtag_robotics.models import (
     preserve_fields,
 )
 from hashtag_robotics.policy import PolicyStore
+from hashtag_robotics.recording_plan import (
+    RecordingPlanError,
+    RecordingPlanParseRequest,
+    RecordingRoadmap,
+    parse_recording_roadmap,
+)
 from hashtag_robotics.repository import Repository, ResourceBusyError
 from hashtag_robotics.safety import SafetyService
 from hashtag_robotics.security import (
@@ -94,6 +101,12 @@ from hashtag_robotics.simulation import (
     so101_scene_path,
 )
 from hashtag_robotics.strands_runtime import StrandsPlanner, StrandsRuntimeError
+from hashtag_robotics.tic_tac_toe import (
+    TIC_TAC_TOE_POLICY_REPO,
+    TIC_TAC_TOE_POLICY_REVISION,
+    TIC_TAC_TOE_PROFILE,
+    tic_tac_toe_catalogue,
+)
 from hashtag_robotics.workflows import WORKFLOW_STEPS, WorkflowEngine
 
 # A session that has not published a frame in this long has ended; close the
@@ -102,6 +115,7 @@ SIM_LIVE_IDLE_SECONDS = 5.0
 # How often the live stream asks whether a simulated session is still going.
 # Cheap enough to be honest, rare enough not to poll the job table at 20 Hz.
 SIM_LIVE_SESSION_POLL_SECONDS = 2.0
+RECORDING_MJPEG_BOUNDARY = "hashtagrecordingframe"
 
 
 def sim_live_should_close(idle_for: float, session_alive: bool) -> bool:
@@ -509,6 +523,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if role not in {DeviceRole.FOLLOWER, DeviceRole.LEADER}:
             raise HTTPException(status_code=422, detail="Slots exist for follower and leader only")
 
+        if max_relative_target is not None and not (
+            0 < max_relative_target <= runtime.settings.max_relative_target_ceiling
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "max_relative_target must be greater than 0 and no greater than "
+                    f"{runtime.settings.max_relative_target_ceiling}."
+                ),
+            )
+
         kind = "robot" if role == DeviceRole.FOLLOWER else "teleoperator"
         model = RobotProfile if role == DeviceRole.FOLLOWER else TeleoperatorProfile
         existing = (
@@ -565,7 +590,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload["safety_profile"] = {
                 "max_relative_target": max_relative_target
                 if max_relative_target is not None
-                else (existing.safety_profile.get("max_relative_target", 5) if existing else 5)
+                else (
+                    existing.safety_profile.get(
+                        "max_relative_target", runtime.settings.default_max_relative_target
+                    )
+                    if existing
+                    else runtime.settings.default_max_relative_target
+                )
             }
         else:
             payload["teleoperator_type"] = device_type
@@ -591,6 +622,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         return runtime.commissioning.status()
 
+    @app.post("/api/setup/follower-limit", response_model=SetupStatus)
+    async def update_follower_limit(
+        max_relative_target: Annotated[float, Body(embed=True)],
+    ) -> SetupStatus:
+        """Update only the follower tracking-error cap; preserve every other binding."""
+        ceiling = runtime.settings.max_relative_target_ceiling
+        if not 0 < max_relative_target <= ceiling:
+            raise HTTPException(
+                status_code=422,
+                detail=f"max_relative_target must be greater than 0 and no greater than {ceiling}.",
+            )
+
+        profile = runtime.commissioning.robot_profile()
+        if profile is None:
+            raise HTTPException(status_code=409, detail="Follower slot is empty")
+
+        safety_profile = dict(profile.safety_profile)
+        safety_profile["max_relative_target"] = float(max_relative_target)
+        runtime.repository.upsert_entity(
+            "robot", profile.model_copy(update={"safety_profile": safety_profile})
+        )
+        runtime.repository.append_audit(
+            AuditEvent(
+                actor="local-user",
+                action="setup.follower_limit",
+                target=profile.id,
+                correlation_id="setup",
+                outcome=str(float(max_relative_target)),
+                details={"max_relative_target": float(max_relative_target)},
+            )
+        )
+        return runtime.commissioning.status()
+
     @app.post("/api/robots/{robot_id}/validate", response_model=list[SafetyCheck])
     async def validate_robot(robot_id: str) -> list[SafetyCheck]:
         profile = runtime.repository.get_entity("robot", robot_id, RobotProfile)
@@ -611,9 +675,76 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         directory: Annotated[str, Body(embed=True)],
     ) -> list[CalibrationArtifact]:
         try:
-            return runtime.calibration.import_directory(Path(directory))
+            return runtime.calibration.import_directory(Path(directory).expanduser())
         except CalibrationError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.post("/api/setup/calibrations/bind", response_model=SetupStatus)
+    async def bind_existing_calibration(
+        role: Annotated[DeviceRole, Body()],
+        artifact_id: Annotated[str, Body()],
+    ) -> SetupStatus:
+        """Restore one known revision and bind it to the matching setup slot.
+
+        Imported LeRobot ids do not have to be ``follower01`` / ``leader01``.
+        Binding therefore belongs on the server: it changes the profile id and
+        the revision together after checking that the artifact is valid and is
+        for the requested role.
+        """
+        if role not in {DeviceRole.FOLLOWER, DeviceRole.LEADER}:
+            raise HTTPException(status_code=422, detail="Calibration slots exist for arms only")
+
+        artifact = runtime.repository.get_entity("calibration", artifact_id, CalibrationArtifact)
+        if artifact is None:
+            raise HTTPException(status_code=404, detail="Calibration artifact not found")
+        if artifact.role != role:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Calibration '{artifact.device_id}' belongs to {artifact.role.value}, "
+                    f"not {role.value}."
+                ),
+            )
+        if not artifact.validation_result.get("valid"):
+            problems = artifact.validation_result.get("problems", [])
+            detail = "; ".join(problems) or "The calibration contents are invalid."
+            raise HTTPException(status_code=422, detail=detail)
+
+        profile = (
+            runtime.commissioning.robot_profile()
+            if role == DeviceRole.FOLLOWER
+            else runtime.commissioning.teleoperator_profile()
+        )
+        if profile is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Fill the {role.value} slot before binding a calibration.",
+            )
+
+        try:
+            restored = runtime.calibration.restore(artifact.id)
+        except CalibrationError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+        if isinstance(profile, RobotProfile):
+            runtime.calibration.bind_robot(profile, restored)
+        else:
+            runtime.calibration.bind_teleoperator(profile, restored)
+        runtime.repository.append_audit(
+            AuditEvent(
+                actor="local-user",
+                action="calibration.bind_existing",
+                target=profile.id,
+                correlation_id="setup",
+                outcome=restored.id,
+                details={
+                    "role": role.value,
+                    "device_type": restored.device_type,
+                    "device_id": restored.device_id,
+                },
+            )
+        )
+        return runtime.commissioning.status()
 
     @app.post("/api/calibrations/{artifact_id}/restore", response_model=CalibrationArtifact)
     async def restore_calibration(artifact_id: str) -> CalibrationArtifact:
@@ -628,6 +759,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/cameras", response_model=CameraProfile)
     async def save_camera(profile: CameraProfile) -> CameraProfile:
+        duplicate = next(
+            (
+                item
+                for item in runtime.repository.list_entities("camera", CameraProfile)
+                if item.id != profile.id
+                and item.device_fingerprint == profile.device_fingerprint
+                and item.id != "camera_sim_front"
+            ),
+            None,
+        )
+        if duplicate is not None:
+            profile = profile.model_copy(
+                update={"id": duplicate.id, "created_at": duplicate.created_at}
+            )
         runtime.repository.upsert_entity("camera", profile)
         return profile
 
@@ -673,7 +818,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.get("/api/cameras/{camera_id}/preview.mjpg")
-    async def camera_preview_stream(camera_id: str) -> StreamingResponse:
+    async def camera_preview_stream(camera_id: str, request: Request) -> StreamingResponse:
         """Stream MJPEG while holding the camera exclusively for this client."""
         profile = runtime.repository.get_entity("camera", camera_id, CameraProfile)
         if profile is None:
@@ -682,33 +827,182 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # One owner per connection, so a second viewer collides instead of
         # silently refreshing the first viewer's lease.
         owner = new_id("preview")
-        request = ResourceRequest(
+        lease_request = ResourceRequest(
             resource_id=camera_id,
             resource_type="camera",
             mode="exclusive",
         )
         try:
-            runtime.repository.acquire_leases(owner, [request])
+            runtime.repository.acquire_leases(owner, [lease_request])
         except ResourceBusyError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
-        def stream() -> Iterator[bytes]:
+        async def stream() -> AsyncIterator[bytes]:
             beat = time.monotonic()
             try:
-                for chunk in runtime.cameras.frames(profile):
-                    now = time.monotonic()
-                    if now - beat > 5:
-                        beat = now
-                        runtime.repository.heartbeat_leases(owner)
-                    yield chunk
+                # An async-for consumer does not own or automatically close a
+                # nested async generator when the HTTP client disconnects.
+                # Explicit ownership is what reaches CameraService's FFmpeg
+                # cleanup instead of leaving the UVC device open.
+                async with aclosing(runtime.cameras.async_frames(profile)) as frames:
+                    async for chunk in frames:
+                        if await request.is_disconnected():
+                            break
+                        now = time.monotonic()
+                        if now - beat > 5:
+                            beat = now
+                            runtime.repository.heartbeat_leases(owner)
+                        yield chunk
             finally:
                 runtime.repository.release_leases(owner)
 
         try:
-            return StreamingResponse(stream(), media_type=MJPEG_CONTENT_TYPE)
+            return StreamingResponse(
+                stream(),
+                media_type=MJPEG_CONTENT_TYPE,
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                    "Pragma": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
         except CameraError as error:
             runtime.repository.release_leases(owner)
             raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/api/recordings/{job_id}/cameras/{camera_role}.mjpg")
+    async def recording_camera_stream(
+        job_id: str,
+        camera_role: str,
+        request: Request,
+    ) -> StreamingResponse:
+        """Relay frames already read by LeRobot; never open the camera twice."""
+        job = runtime.repository.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Recording job not found")
+        if job.kind not in {JobKind.RECORDING, JobKind.EVALUATION, JobKind.POLICY_ROLLOUT}:
+            raise HTTPException(status_code=409, detail="This job has no physical camera relay")
+        roles = set(job.resolved_targets.camera_profile_ids) if job.resolved_targets else set()
+        if camera_role not in roles:
+            raise HTTPException(status_code=404, detail="Camera role is not mapped for this job")
+        try:
+            frame_path = runtime.settings.recording_live_frame_path(job_id, camera_role)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+        active_states = {
+            JobState.QUEUED,
+            JobState.STARTING,
+            JobState.RUNNING,
+            JobState.STOPPING,
+        }
+
+        def session_running() -> bool:
+            current = runtime.repository.get_job(job_id)
+            return current is not None and current.state in active_states
+
+        waited = 0.0
+        while session_running() and not frame_path.is_file() and waited < SIM_LIVE_STARTUP_SECONDS:
+            if await request.is_disconnected():
+                raise HTTPException(status_code=499, detail="Viewer disconnected")
+            await asyncio.sleep(0.2)
+            waited += 0.2
+        if not frame_path.is_file():
+            raise HTTPException(
+                status_code=409,
+                detail="The recorder has not published this camera yet.",
+            )
+
+        def stream() -> Iterator[bytes]:
+            last = 0.0
+            idle_since = time.monotonic()
+            checked_at = 0.0
+            alive = True
+            while True:
+                try:
+                    stamp = frame_path.stat().st_mtime
+                except OSError:
+                    return
+                if stamp != last:
+                    last = stamp
+                    idle_since = time.monotonic()
+                    payload = frame_path.read_bytes()
+                    if payload:
+                        yield (
+                            (
+                                f"--{RECORDING_MJPEG_BOUNDARY}\r\n"
+                                f"Content-Type: image/jpeg\r\n"
+                                f"Content-Length: {len(payload)}\r\n\r\n"
+                            ).encode()
+                            + payload
+                            + b"\r\n"
+                        )
+                else:
+                    now = time.monotonic()
+                    idle_for = now - idle_since
+                    if idle_for > SIM_LIVE_IDLE_SECONDS:
+                        if now - checked_at > SIM_LIVE_SESSION_POLL_SECONDS:
+                            checked_at = now
+                            alive = session_running()
+                        if sim_live_should_close(idle_for, alive):
+                            return
+                        idle_since = now
+                time.sleep(0.05)
+
+        return StreamingResponse(
+            stream(),
+            media_type=f"multipart/x-mixed-replace; boundary={RECORDING_MJPEG_BOUNDARY}",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post("/api/recording-plans/parse", response_model=RecordingRoadmap)
+    async def parse_recording_plan(request: RecordingPlanParseRequest) -> RecordingRoadmap:
+        """Validate a local roadmap upload and return its executable game queue."""
+        try:
+            return parse_recording_roadmap(request.source_name, request.content)
+        except RecordingPlanError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/api/recordings/{job_id}/status")
+    async def recording_status(job_id: str) -> dict[str, Any]:
+        """Expose what is already durable instead of guessing from job progress."""
+        job = runtime.repository.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Recording job not found")
+        if job.kind not in {JobKind.RECORDING, JobKind.SIM_RECORDING}:
+            raise HTTPException(status_code=409, detail="This job does not write a dataset")
+        repo_id = str(job.parameters.get("repo_id", "")).strip()
+        if not repo_id:
+            raise HTTPException(status_code=409, detail="Recording job has no dataset repo id")
+        started_at = job.process.started_at if job.process is not None else job.created_at
+        status = runtime.datasets.recording_status(
+            repo_id,
+            job.parameters.get("dataset_root"),
+            started_at=started_at,
+        )
+        status.update(
+            {
+                "job_id": job.id,
+                "job_state": job.state.value,
+                "planned_episodes": int(job.parameters.get("episodes", 0) or 0),
+                "dataset_episode_start": int(job.parameters.get("dataset_episode_start", 0) or 0),
+                "finalized": job.state
+                not in {
+                    JobState.CREATED,
+                    JobState.VALIDATING,
+                    JobState.AWAITING_CONFIRMATION,
+                    JobState.QUEUED,
+                    JobState.STARTING,
+                    JobState.RUNNING,
+                    JobState.STOPPING,
+                },
+            }
+        )
+        return status
 
     @app.get("/api/datasets", response_model=list[DatasetManifest])
     async def datasets() -> list[DatasetManifest]:
@@ -813,6 +1107,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             ),
         }
+
+    @app.get("/api/datasets/{dataset_id}/episodes/{episode_index}/videos/{camera}.mp4")
+    async def dataset_episode_video(
+        dataset_id: str,
+        episode_index: int,
+        camera: str,
+    ) -> FileResponse:
+        """Serve the MP4 containing one episode's camera segment with range support."""
+        manifest = _resolve_dataset(dataset_id)
+        if not manifest.repo_id:
+            raise HTTPException(status_code=409, detail="This dataset has no repo id to read.")
+        episodes = runtime.datasets.episodes(manifest.repo_id, manifest.local_path or None)
+        episode = next((item for item in episodes if item["index"] == episode_index), None)
+        if episode is None:
+            raise HTTPException(status_code=404, detail="Episode not found")
+        video = next((item for item in episode.get("videos", []) if item["camera"] == camera), None)
+        if video is None:
+            raise HTTPException(status_code=404, detail="Episode camera video not found")
+
+        root = runtime.datasets.root_for(manifest.repo_id, manifest.local_path or None)
+        path = (
+            root
+            / "videos"
+            / str(video["feature"])
+            / f"chunk-{int(video['chunk_index']):03d}"
+            / f"file-{int(video['file_index']):03d}.mp4"
+        )
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Episode video file is missing")
+        return FileResponse(
+            path,
+            media_type="video/mp4",
+            filename=f"episode-{episode_index}-{camera}.mp4",
+            content_disposition_type="inline",
+            headers={"Cache-Control": "private, max-age=60"},
+        )
 
     @app.post("/api/datasets/{dataset_id}/episodes/remove", response_model=JobRecord)
     async def remove_dataset_episodes(
@@ -928,6 +1258,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/policies", response_model=list[PolicyManifest])
     async def policies() -> list[PolicyManifest]:
         return runtime.repository.list_entities("policy", PolicyManifest)
+
+    @app.get("/api/policy-rollouts/tic-tac-toe")
+    async def tic_tac_toe_rollout_catalogue() -> dict[str, Any]:
+        """The finite set of physical moves the dashboard may request."""
+        return {
+            "profile": TIC_TAC_TOE_PROFILE,
+            "policy_repo_id": TIC_TAC_TOE_POLICY_REPO,
+            "policy_revision": TIC_TAC_TOE_POLICY_REVISION,
+            "moves": tic_tac_toe_catalogue(),
+        }
 
     @app.post("/api/policies", response_model=PolicyManifest)
     async def save_policy(manifest: PolicyManifest) -> PolicyManifest:
@@ -1283,11 +1623,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         was_engaged = await runtime.jobs.clear_emergency_stop()
         return {"was_engaged": was_engaged, "engaged": runtime.safety.estop_engaged()}
 
-    @app.get("/api/safety/status")
-    async def safety_status() -> dict[str, Any]:
+    def _safety_status() -> dict[str, Any]:
         return {
             "emergency_stop_engaged": runtime.safety.estop_engaged(),
             "physical_enabled": runtime.settings.enable_physical,
+            "default_max_relative_target": runtime.settings.default_max_relative_target,
             "max_relative_target_ceiling": runtime.settings.max_relative_target_ceiling,
             "runtime_available": runtime.hardware.runtime_available(),
             # What the last emergency stop managed to de-energise. A latched
@@ -1295,6 +1635,76 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # not have to read the audit log to discover.
             "last_torque_release": runtime.safety.last_torque_release(),
         }
+
+    @app.get("/api/safety/status")
+    async def safety_status() -> dict[str, Any]:
+        return _safety_status()
+
+    @app.post("/api/safety/physical-gate")
+    async def set_physical_gate(request: PhysicalGateRequest) -> dict[str, Any]:
+        """Open or close real actuation for this local process only.
+
+        Opening the gate never starts a job or moves an arm. It is deliberately
+        ephemeral: restarting the control plane returns to the configured safe
+        default. Closing the gate while real hardware is active first applies
+        the existing emergency-stop path so a running child process cannot keep
+        issuing commands after the UI says the gate is closed.
+        """
+        if request.enabled:
+            if not request.confirmed:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Fiziksel kapıyı açmak için çalışma alanını ve E-STOP erişimini "
+                        "doğruladığını onaylamalısın."
+                    ),
+                )
+            if not runtime.settings.binds_to_loopback:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Fiziksel kontrol yalnızca loopback üzerinde açılabilir.",
+                )
+            if runtime.safety.estop_engaged():
+                raise HTTPException(
+                    status_code=409,
+                    detail="E-STOP mandalı açıkken fiziksel kapı açılamaz.",
+                )
+
+        active_real_jobs = [
+            job
+            for job in runtime.repository.list_jobs(limit=500)
+            if job.target_mode == TargetMode.REAL
+            and job.state
+            in {
+                JobState.QUEUED,
+                JobState.STARTING,
+                JobState.RUNNING,
+                JobState.STOPPING,
+            }
+        ]
+        auto_estop = bool(active_real_jobs) and not request.enabled
+        if auto_estop:
+            await runtime.jobs.emergency_stop(actor="physical-gate")
+
+        previous = runtime.settings.enable_physical
+        runtime.settings.enable_physical = request.enabled
+        runtime.repository.append_audit(
+            AuditEvent(
+                actor="local-user",
+                action="safety.physical_gate",
+                target="physical-actuation",
+                correlation_id="physical-gate",
+                outcome="enabled" if request.enabled else "disabled",
+                details={
+                    "previous": previous,
+                    "current": request.enabled,
+                    "scope": "process-lifetime",
+                    "auto_estop": auto_estop,
+                    "active_real_jobs": [job.id for job in active_real_jobs],
+                },
+            )
+        )
+        return _safety_status()
 
     @app.get("/api/audit", response_model=list[AuditEvent])
     async def audit(limit: Annotated[int, Query(ge=1, le=1000)] = 200) -> list[AuditEvent]:
@@ -1366,13 +1776,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         @app.get("/", include_in_schema=False)
         async def frontend_index() -> FileResponse:
-            return FileResponse(index_file)
+            # The JS/CSS filenames are content-hashed and may be cached for a
+            # long time; the small HTML shell must not be. Otherwise a tab
+            # reopened after a dashboard rebuild can keep booting yesterday's
+            # asset names and make newly added controls appear to be missing.
+            return FileResponse(index_file, headers={"Cache-Control": "no-store"})
 
         @app.get("/{route:path}", include_in_schema=False)
         async def frontend_fallback(route: str) -> FileResponse:
             if route.startswith("api/"):
                 raise HTTPException(status_code=404)
-            return FileResponse(index_file)
+            return FileResponse(index_file, headers={"Cache-Control": "no-store"})
     else:
 
         @app.get("/", include_in_schema=False)

@@ -15,12 +15,20 @@ from hashtag_robotics.models import (
     CheckStatus,
     JobCreateRequest,
     JobKind,
+    PolicyManifest,
+    ResolvedTargets,
     RobotProfile,
     TargetMode,
     TeleoperatorProfile,
 )
 from hashtag_robotics.repository import Repository
 from hashtag_robotics.safety import SafetyService
+from hashtag_robotics.tic_tac_toe import (
+    TIC_TAC_TOE_POLICY_REPO,
+    TIC_TAC_TOE_POLICY_REVISION,
+    TIC_TAC_TOE_PROFILE,
+    canonical_tic_tac_toe_parameters,
+)
 
 
 def motors(offsets: list[int]) -> dict[str, dict[str, int]]:
@@ -187,6 +195,66 @@ def teleoperation(lab: Lab, **overrides: object) -> JobCreateRequest:
 
 def codes(result, status: CheckStatus) -> set[str]:
     return {check.code for check in result.checks if check.status == status}
+
+
+def test_tic_tac_toe_profile_pins_policy_calibration_and_motion_limit(lab: Lab) -> None:
+    policy = PolicyManifest(
+        name="Tic-Tac-Toe 80K",
+        policy_type="smolvla",
+        model_repo_id=TIC_TAC_TOE_POLICY_REPO,
+        model_revision=TIC_TAC_TOE_POLICY_REVISION,
+    )
+    lab.repository.upsert_entity("policy", policy)
+    parameters = canonical_tic_tac_toe_parameters(
+        {
+            "rollout_profile": TIC_TAC_TOE_PROFILE,
+            "move_id": "X-7",
+            "policy_id": policy.id,
+        }
+    )
+    request = JobCreateRequest(
+        kind=JobKind.POLICY_ROLLOUT,
+        target_mode=TargetMode.REAL,
+        parameters=parameters,
+        requested_by="test",
+    )
+    resolved = ResolvedTargets(robot_id="denizli", max_relative_target=5.0)
+
+    checks = lab.safety._tic_tac_toe_checks(request, resolved)
+
+    assert all(check.status == CheckStatus.PASS for check in checks)
+
+
+def test_tic_tac_toe_profile_rejects_an_unvalidated_policy_revision(lab: Lab) -> None:
+    policy = PolicyManifest(
+        name="Different revision",
+        policy_type="smolvla",
+        model_repo_id=TIC_TAC_TOE_POLICY_REPO,
+        model_revision="a" * 40,
+    )
+    lab.repository.upsert_entity("policy", policy)
+    parameters = canonical_tic_tac_toe_parameters(
+        {
+            "rollout_profile": TIC_TAC_TOE_PROFILE,
+            "move_id": "O-3",
+            "policy_id": policy.id,
+        }
+    )
+    request = JobCreateRequest(
+        kind=JobKind.POLICY_ROLLOUT,
+        target_mode=TargetMode.REAL,
+        parameters=parameters,
+        requested_by="test",
+    )
+
+    checks = lab.safety._tic_tac_toe_checks(
+        request,
+        ResolvedTargets(robot_id="denizli", max_relative_target=5.0),
+    )
+
+    assert next(check for check in checks if check.code == "ttt.policy_revision").status == (
+        CheckStatus.BLOCKED
+    )
 
 
 def test_client_cannot_self_certify_physical_readiness(lab: Lab) -> None:
@@ -358,6 +426,43 @@ def test_a_mapped_camera_is_resolved_into_the_lerobot_command(lab: Lab) -> None:
     assert ("camera", "exclusive") in leases
 
 
+def test_a_mapped_avfoundation_uid_camera_is_reported_without_an_index(
+    lab: Lab, monkeypatch
+) -> None:
+    lab.connect_camera()
+    device = next(
+        item
+        for item in lab.discovery.snapshot(include_simulated=False)
+        if item.kind.value == "camera"
+    )
+    camera = CameraProfile(
+        name="Wrist",
+        device_fingerprint=device.stable_fingerprint,
+        semantic_name="wrist",
+    )
+    lab.repository.upsert_entity("camera", camera)
+    lab.robot.camera_mapping = {"wrist": camera.id}
+    lab.repository.upsert_entity("robot", lab.robot)
+    config = {
+        "type": "avfoundation_uid",
+        "unique_id": "0x211000005a39230",
+        "helper_path": "/tmp/avfoundation-uid-capture",
+        "fps": 30,
+        "width": 640,
+        "height": 480,
+        "rotation": 0,
+    }
+    monkeypatch.setattr(lab.safety.cameras, "lerobot_config", lambda *_, **__: config)
+
+    result = lab.safety.preflight(teleoperation(lab))
+
+    assert result.allowed is True
+    check = next(item for item in result.checks if item.code == "camera.mapping_resolved")
+    assert "wrist=0x211000005a39230" in check.message
+    assert result.resolved is not None
+    assert result.resolved.cameras["wrist"] == config
+
+
 def test_a_mapped_camera_that_is_unplugged_blocks_actuation(lab: Lab) -> None:
     camera = CameraProfile(
         name="Front",
@@ -374,6 +479,89 @@ def test_a_mapped_camera_that_is_unplugged_blocks_actuation(lab: Lab) -> None:
     assert "camera.mapping_resolved" in codes(result, CheckStatus.BLOCKED)
     assert result.resolved is not None
     assert result.resolved.cameras == {}
+
+
+def test_policy_rollout_resolves_checkpoint_and_camera_mapping_on_the_server(
+    lab: Lab,
+    tmp_path: Path,
+) -> None:
+    for link_name in (
+        "usb-SO101_Top_0001-video-index0",
+        "usb-SO101_Wrist_0002-video-index0",
+    ):
+        lab.connect_camera(link_name)
+    camera_devices = [
+        item
+        for item in lab.discovery.snapshot(include_simulated=False)
+        if item.kind.value == "camera"
+    ]
+    assert len(camera_devices) == 2
+    camera_ids: dict[str, str] = {}
+    for semantic, device in zip(("top", "wrist"), camera_devices, strict=True):
+        profile = CameraProfile(
+            name=semantic,
+            device_fingerprint=device.stable_fingerprint,
+            semantic_name=semantic,
+            width=640,
+            height=480,
+            fps=30,
+        )
+        lab.repository.upsert_entity("camera", profile)
+        camera_ids[semantic] = profile.id
+    lab.robot.camera_mapping = camera_ids
+    lab.repository.upsert_entity("robot", lab.robot)
+
+    checkpoint = tmp_path / "policy"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{}")
+    (checkpoint / "model.safetensors").write_bytes(b"weights")
+    policy = PolicyManifest(
+        name="Tic-Tac-Toe SmolVLA",
+        policy_type="smolvla",
+        checkpoint=str(checkpoint),
+        model_revision="b" * 40,
+        expected_features=[
+            "observation.state",
+            "observation.images.camera1",
+            "observation.images.camera2",
+            "observation.images.camera3",
+            "action",
+        ],
+        action_shape=[6],
+        camera_mapping={
+            "observation.images.top": "observation.images.camera1",
+            "observation.images.wrist": "observation.images.camera2",
+        },
+        empty_cameras=1,
+        compatibility_status="hub-checkpoint-read",
+    )
+    lab.repository.upsert_entity("policy", policy)
+
+    request = JobCreateRequest(
+        kind=JobKind.POLICY_ROLLOUT,
+        target_mode=TargetMode.REAL,
+        parameters={
+            "policy_id": policy.id,
+            "policy_path": "/tmp/client-injected",
+            "robot_profile_id": lab.robot.id,
+            "workspace_confirmed": True,
+        },
+        requested_by="test",
+    )
+    preflight = lab.safety.preflight(request)
+
+    assert preflight.allowed is True
+    assert preflight.resolved is not None
+    assert preflight.resolved.policy_checkpoint == str(checkpoint)
+    assert "policy.checkpoint_present" in codes(preflight, CheckStatus.PASS)
+    assert "policy.camera_mapping" in codes(preflight, CheckStatus.PASS)
+
+    effective = lab.safety.apply_resolution(request, preflight.resolved)
+    assert effective.parameters["policy_path"] == str(checkpoint)
+    assert effective.parameters["rename_map"] == {
+        "observation.images.top": "observation.images.camera1",
+        "observation.images.wrist": "observation.images.camera2",
+    }
 
 
 def test_a_disconnected_arm_blocks_actuation(lab: Lab) -> None:

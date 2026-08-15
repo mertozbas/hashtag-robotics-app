@@ -13,6 +13,7 @@ from hashtag_robotics.config import Settings
 from hashtag_robotics.dataset import (
     STATUS_INCOMPLETE,
     STATUS_MISSING,
+    STATUS_VERIFIED,
     DatasetError,
     DatasetStore,
     lineage_overlaps,
@@ -110,6 +111,12 @@ WORKFLOW_STEPS: dict[JobKind, list[str]] = {
         "Preparing a reproducible training configuration",
         "Running the safe mock trainer",
         "Registering the resulting policy",
+    ],
+    JobKind.POLICY_IMPORT: [
+        "Resolving the pinned Hugging Face revision",
+        "Downloading the model snapshot",
+        "Inspecting weights and feature contracts",
+        "Registering the runnable policy",
     ],
     JobKind.EVALUATION: [
         "Checking policy compatibility",
@@ -244,6 +251,9 @@ class WorkflowEngine:
         if job.kind == JobKind.HUB_SYNC:
             return await self._sync_to_hub(job, progress, cancelled)
 
+        if job.kind == JobKind.POLICY_IMPORT:
+            return await self._import_policy(job, progress, cancelled)
+
         steps = WORKFLOW_STEPS[job.kind]
         for index, message in enumerate(steps, start=1):
             if cancelled():
@@ -253,6 +263,48 @@ class WorkflowEngine:
         result = self._finalize(job)
         await progress(1.0, "Completed")
         return result
+
+    async def _import_policy(
+        self,
+        job: JobRecord,
+        progress: ProgressCallback,
+        cancelled: CancelCheck,
+    ) -> dict[str, Any]:
+        """Download and inspect a model without ever exposing the Hub token."""
+        repo_id = str(job.parameters.get("repo_id", "")).strip()
+        revision = str(job.parameters.get("revision", "")).strip() or None
+        name = str(job.parameters.get("name", "")).strip() or None
+        raw_mapping = job.parameters.get("camera_mapping")
+        camera_mapping = (
+            {str(key): str(value) for key, value in raw_mapping.items()}
+            if isinstance(raw_mapping, dict)
+            else None
+        )
+        if cancelled():
+            raise WorkflowCancelled("The job was stopped before the download started.")
+        await progress(0.05, f"Resolving pinned revision for {repo_id}")
+        try:
+            manifest = await asyncio.to_thread(
+                self.policies.import_from_hub,
+                repo_id,
+                revision=revision,
+                name=name,
+                camera_mapping=camera_mapping,
+            )
+        except PolicyError as error:
+            return {"artifact_error": str(error), "policy_id": None, "repo_id": repo_id}
+        await progress(1.0, "Completed")
+        return {
+            "policy_id": manifest.id,
+            "repo_id": manifest.model_repo_id,
+            "revision": manifest.model_revision,
+            "checkpoint": manifest.checkpoint,
+            "policy_type": manifest.policy_type,
+            "action_shape": manifest.action_shape,
+            "camera_mapping": manifest.camera_mapping,
+            "empty_cameras": manifest.empty_cameras,
+            "compatibility_status": manifest.compatibility_status,
+        }
 
     def _request_for(self, job: JobRecord) -> JobCreateRequest:
         return JobCreateRequest(
@@ -425,6 +477,21 @@ class WorkflowEngine:
         if job.parameters.get("dry_run", False):
             await progress(1.0, "Completed")
             return {**plan, "uploaded": False, "note": "Dry run: nothing was sent."}
+
+        # The approval may have been created from an older manifest. Re-read
+        # disk at the irreversible boundary so a later task/video mismatch can
+        # never ride a stale green badge to the Hub.
+        manifest = self.datasets.revalidate(manifest)
+        if manifest.integrity_status != STATUS_VERIFIED:
+            problems = manifest.integrity_report.get("problems", [])
+            return {
+                **plan,
+                "uploaded": False,
+                "artifact_error": (
+                    "The dataset failed its current on-disk integrity audit and was not "
+                    f"uploaded: {'; '.join(str(problem) for problem in problems)}"
+                ),
+            }
 
         if cancelled():
             raise WorkflowCancelled("The job was stopped by the operator.")
@@ -619,23 +686,75 @@ class WorkflowEngine:
         # this one's output.
         recorded = self.datasets.resolve_recorded(repo_id, root, started_at=_launched_at(job))
         report = self.datasets.inspect(recorded, root)
-        if salvaged:
-            if report["integrity_status"] == STATUS_MISSING:
+        if salvaged and report["integrity_status"] == STATUS_MISSING:
+            return {
+                "requested_repo_id": repo_id,
+                "recorded_repo_id": None,
+                "artifact_error": "The recording stopped before writing anything to disk.",
+            }
+        targets = job.resolved_targets
+        episode_plan = job.parameters.get("episode_plan")
+        plan_sidecar: str | None = None
+        dataset_episode_start = int(job.parameters.get("dataset_episode_start", 0))
+        durable_episode_count = max(
+            0,
+            int(report.get("total_episodes", 0) or 0) - dataset_episode_start,
+        )
+        durable_episode_plan = (
+            episode_plan[:durable_episode_count]
+            if isinstance(episode_plan, list) and durable_episode_count > 0
+            else []
+        )
+        if durable_episode_plan:
+            try:
+                sidecar = self.datasets.write_episode_plan(
+                    report["root"],
+                    durable_episode_plan,
+                    dataset_episode_start,
+                )
+                plan_sidecar = sidecar.relative_to(Path(report["root"])).as_posix()
+            except (DatasetError, OSError, TypeError, ValueError) as error:
                 return {
-                    "requested_repo_id": repo_id,
-                    "recorded_repo_id": None,
-                    "artifact_error": "The recording stopped before writing anything to disk.",
+                    "artifact_error": f"Dataset was written but its episode plan was not: {error}"
                 }
+
+            # The first inspection happened before the intended plan existed on
+            # disk. Re-read now so task labels and video windows participate in
+            # the same integrity result that is registered and later uploaded.
+            report = self.datasets.inspect(recorded, root)
+
+        if salvaged:
             report["problems"].append(
                 "The recording did not finish, so this dataset holds only the episodes "
                 "written before it stopped."
             )
             report["integrity_status"] = STATUS_INCOMPLETE
-        targets = job.resolved_targets
+
+        existing = next(
+            (
+                item
+                for item in self.repository.list_entities("dataset", DatasetManifest)
+                if item.local_path
+                and Path(item.local_path).resolve() == Path(report["root"]).resolve()
+            ),
+            None,
+        )
+        recording_plan = job.parameters.get("recording_plan")
+        recording_plan = recording_plan if isinstance(recording_plan, dict) else {}
+        recording_session = {
+            **recording_plan,
+            "job_id": job.id,
+            "dataset_episode_start": dataset_episode_start,
+            "episodes": durable_episode_count,
+        }
+        stored_sessions = (existing.provenance if existing else {}).get("recording_sessions", [])
+        previous_sessions = list(stored_sessions) if isinstance(stored_sessions, list) else []
+        if recording_plan:
+            previous_sessions.append(recording_session)
         manifest = self.datasets.manifest(
             report,
-            name=str(job.parameters.get("name", repo_id)),
-            task=str(job.parameters.get("task", "")),
+            name=existing.name if existing else str(job.parameters.get("name", repo_id)),
+            task=(existing.task if existing else str(job.parameters.get("task", ""))),
             robot_profile_id=targets.robot_profile_id if targets else None,
             teleoperator_profile_id=targets.teleoperator_profile_id if targets else None,
             calibration_revision=targets.robot_calibration_revision if targets else None,
@@ -643,6 +762,7 @@ class WorkflowEngine:
                 name: f"observation.images.{name}" for name in (targets.cameras if targets else {})
             },
             provenance={
+                **(existing.provenance if existing else {}),
                 "job_id": job.id,
                 "target_mode": job.target_mode.value,
                 "source": RECORDING_SOURCE.get(job.kind, "real-arm"),
@@ -652,7 +772,10 @@ class WorkflowEngine:
                     else "lerobot-record"
                 ),
                 "scenario_id": job.parameters.get("scenario_id"),
+                **({"recording_sessions": previous_sessions} if previous_sessions else {}),
+                **({"episode_plan_sidecar": plan_sidecar} if plan_sidecar else {}),
             },
+            manifest_id=existing.id if existing else None,
         )
         return {
             "dataset_id": manifest.id,
@@ -707,6 +830,32 @@ class WorkflowEngine:
             summary["episodes_recorded"] = report.get("total_episodes", 0)
             summary["rollout_dataset"] = report["root"]
             summary["integrity_status"] = report["integrity_status"]
+            if (
+                report["integrity_status"] != STATUS_MISSING
+                and int(report.get("total_episodes", 0) or 0) > 0
+            ):
+                targets = job.resolved_targets
+                manifest = self.datasets.manifest(
+                    report,
+                    name=str(job.parameters.get("name", f"Policy rollout · {repo_id}")),
+                    task=str(job.parameters.get("task", "")),
+                    robot_profile_id=targets.robot_profile_id if targets else None,
+                    calibration_revision=(targets.robot_calibration_revision if targets else None),
+                    camera_mapping={
+                        name: f"observation.images.{name}"
+                        for name in (targets.cameras if targets else {})
+                    },
+                    provenance={
+                        "job_id": job.id,
+                        "target_mode": job.target_mode.value,
+                        "source": "policy-rollout",
+                        "adapter": "hashtag-lerobot-rollout",
+                        "policy_id": job.parameters.get("policy_id"),
+                        "rollout_profile": job.parameters.get("rollout_profile"),
+                        "move_id": job.parameters.get("move_id"),
+                    },
+                )
+                summary["dataset_id"] = manifest.id
         return summary
 
     def _finalize(self, job: JobRecord) -> dict[str, Any]:

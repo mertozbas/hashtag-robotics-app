@@ -131,6 +131,10 @@ class CommissioningService:
         slot.port = (device.stable_path or device.transient_path) if device else profile.port
         slot.lerobot_id = profile.calibration_id
         slot.connected = device is not None
+        if isinstance(profile, RobotProfile):
+            raw_limit = profile.safety_profile.get("max_relative_target")
+            if isinstance(raw_limit, int | float):
+                slot.max_relative_target = float(raw_limit)
         if artifact is not None:
             slot.calibration_revision = artifact.id
             slot.calibration_source = artifact.source.value

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 from hashtag_robotics.calibration import CalibrationError, CalibrationStore
@@ -34,6 +35,15 @@ from hashtag_robotics.models import (
     utc_now,
 )
 from hashtag_robotics.repository import Repository
+from hashtag_robotics.tic_tac_toe import (
+    TIC_TAC_TOE_MAX_RELATIVE_TARGET,
+    TIC_TAC_TOE_POLICY_REPO,
+    TIC_TAC_TOE_POLICY_REVISION,
+    TIC_TAC_TOE_ROBOT_ID,
+    TicTacToePresetError,
+    canonical_tic_tac_toe_parameters,
+    is_tic_tac_toe_parameters,
+)
 
 ESTOP_FLAG = "estop_engaged"
 
@@ -124,6 +134,8 @@ SERVER_OWNED_PARAMETERS = (
     "teleop_port",
     "teleop_calibration_dir",
     "max_relative_target",
+    "policy_path",
+    "rename_map",
 )
 
 
@@ -325,10 +337,12 @@ class SafetyService:
         publishes = request.kind in PUBLISHING_JOB_KINDS and not request.parameters.get(
             "dry_run", False
         )
-        resolved: ResolvedTargets | None = None
+        resolved: ResolvedTargets | None = (
+            ResolvedTargets() if request.kind in POLICY_JOB_KINDS else None
+        )
 
         if request.kind in POLICY_JOB_KINDS:
-            checks.extend(self._policy_checks(request))
+            checks.extend(self._policy_checks(request, resolved))
 
         if request.kind == JobKind.TRAINING:
             checks.extend(self._training_checks(request))
@@ -337,7 +351,7 @@ class SafetyService:
             checks.extend(self._publishing_checks(request))
 
         if is_real_actuation:
-            resolved = ResolvedTargets()
+            resolved = resolved or ResolvedTargets()
             connected = self._connected()
             checks.extend(self._runtime_checks(request))
             checks.extend(self._robot_checks(request, resolved, connected))
@@ -371,6 +385,9 @@ class SafetyService:
                 )
             )
 
+        if request.kind == JobKind.POLICY_ROLLOUT and is_tic_tac_toe_parameters(request.parameters):
+            checks.extend(self._tic_tac_toe_checks(request, resolved))
+
         blocked = any(check.status == CheckStatus.BLOCKED for check in checks)
         return PreflightResult(
             allowed=not blocked,
@@ -378,6 +395,112 @@ class SafetyService:
             checks=checks,
             resolved=resolved,
         )
+
+    def _tic_tac_toe_checks(
+        self,
+        request: JobCreateRequest,
+        resolved: ResolvedTargets | None,
+    ) -> list[SafetyCheck]:
+        """Pin the dashboard profile to the exact bench-validated contract."""
+        try:
+            canonical = canonical_tic_tac_toe_parameters(request.parameters)
+        except TicTacToePresetError as error:
+            return [
+                _check(
+                    "ttt.move_resolved",
+                    "Tic-tac-toe move",
+                    False,
+                    "",
+                    str(error),
+                )
+            ]
+
+        pinned_keys = (
+            "move_id",
+            "task",
+            "ttt_preset",
+            "strategy",
+            "fps",
+            "inference_type",
+            "inference_queue_threshold",
+            "inference_rtc_enabled",
+            "repo_id",
+            "episodes",
+            "episode_time_s",
+            "reset_time_s",
+            "dataset_video",
+            "return_to_initial_position",
+            "disable_torque_on_disconnect",
+        )
+        contract_pinned = all(
+            request.parameters.get(key) == canonical.get(key) for key in pinned_keys
+        )
+
+        policy_id = str(request.parameters.get("policy_id", "")).strip()
+        policy = (
+            self.repository.get_entity("policy", policy_id, PolicyManifest) if policy_id else None
+        )
+        policy_matches = bool(
+            policy
+            and policy.model_repo_id == TIC_TAC_TOE_POLICY_REPO
+            and policy.model_revision == TIC_TAC_TOE_POLICY_REVISION
+        )
+        correct_robot = bool(resolved and resolved.robot_id == TIC_TAC_TOE_ROBOT_ID)
+        correct_limit = bool(
+            resolved
+            and resolved.max_relative_target is not None
+            and abs(resolved.max_relative_target - TIC_TAC_TOE_MAX_RELATIVE_TARGET) < 1e-9
+        )
+        wrapper_ready = resolve_command("hashtag-lerobot-rollout") is not None
+
+        return [
+            _check(
+                "ttt.move_resolved",
+                "Tic-tac-toe move",
+                contract_pinned,
+                (
+                    f"{canonical['move_id']} is pinned to training episode "
+                    f"{canonical['ttt_preset']['episode_index']} and an exact board/start pose."
+                ),
+                "The move does not match the server-owned tic-tac-toe rollout contract.",
+            ),
+            _check(
+                "ttt.policy_revision",
+                "Bench-validated policy revision",
+                policy_matches,
+                f"Policy is pinned to {TIC_TAC_TOE_POLICY_REVISION[:12]}.",
+                "This profile only accepts the bench-validated tic-tac-toe 80K revision.",
+            ),
+            _check(
+                "ttt.robot_calibration",
+                "Demo-pose calibration",
+                correct_robot,
+                f"Follower uses the '{TIC_TAC_TOE_ROBOT_ID}' calibration frame.",
+                "The recorded start poses are valid only for the 'denizli' follower calibration.",
+            ),
+            _check(
+                "ttt.relative_limit",
+                "Bench-validated motion limit",
+                correct_limit,
+                f"Relative target clamp remains {TIC_TAC_TOE_MAX_RELATIVE_TARGET} degrees.",
+                "The tic-tac-toe profile requires an exact 5 degree relative target clamp.",
+            ),
+            _check(
+                "ttt.wrapper_runtime",
+                "Dashboard rollout wrapper",
+                wrapper_ready,
+                "The homing and operator-control wrapper is installed.",
+                "'hashtag-lerobot-rollout' is unavailable; the generic command "
+                "cannot run this profile.",
+            ),
+            _check(
+                "ttt.real_target",
+                "Physical target",
+                request.target_mode == TargetMode.REAL,
+                "The profile targets the explicitly approved physical follower.",
+                "The trained tabletop profile is not exposed as a simulated success path.",
+            ),
+        ]
 
     def create_approval(
         self,
@@ -653,7 +776,20 @@ class SafetyService:
             )
         return checks
 
-    def _policy_checks(self, request: JobCreateRequest) -> list[SafetyCheck]:
+    @staticmethod
+    def _camera_feature(name: str) -> str:
+        stripped = str(name).strip()
+        return (
+            stripped
+            if stripped.startswith("observation.images.")
+            else f"observation.images.{stripped}"
+        )
+
+    def _policy_checks(
+        self,
+        request: JobCreateRequest,
+        resolved: ResolvedTargets | None,
+    ) -> list[SafetyCheck]:
         policy_id = str(request.parameters.get("policy_id", "")).strip()
         policy = (
             self.repository.get_entity("policy", policy_id, PolicyManifest) if policy_id else None
@@ -670,6 +806,15 @@ class SafetyService:
         if policy is None:
             return checks
 
+        if resolved is not None:
+            resolved.policy_id = policy.id
+            resolved.policy_checkpoint = policy.checkpoint
+            resolved.policy_revision = policy.model_revision
+            resolved.rename_map = {
+                self._camera_feature(source): self._camera_feature(target)
+                for source, target in policy.camera_mapping.items()
+            }
+
         expected = list(policy.action_shape)
         matches = expected == [EXPECTED_ACTION_JOINTS]
         checks.append(
@@ -681,6 +826,64 @@ class SafetyService:
                 "match the SO-101 contract.",
                 f"Action shape {expected} or the expected feature list does not match the "
                 "SO-101 contract.",
+            )
+        )
+
+        if request.target_mode != TargetMode.REAL:
+            return checks
+
+        checkpoint = Path(policy.checkpoint).expanduser() if policy.checkpoint else None
+        checkpoint_ready = bool(
+            checkpoint
+            and checkpoint.is_dir()
+            and (checkpoint / "config.json").is_file()
+            and (
+                (checkpoint / "model.safetensors").is_file()
+                or any(checkpoint.glob("model-*.safetensors"))
+            )
+        )
+        checks.append(
+            _check(
+                "policy.checkpoint_present",
+                "Local policy checkpoint",
+                checkpoint_ready,
+                f"Pinned policy files are present under '{checkpoint}'.",
+                "The selected policy has no complete local checkpoint. "
+                "Import it from the Hub first.",
+            )
+        )
+
+        profile = self._robot_profile(request)
+        robot_roles = set(profile.camera_mapping) if profile else set()
+        expected_visuals = {
+            feature
+            for feature in policy.expected_features
+            if feature.startswith("observation.images.")
+        }
+        rename_map = resolved.rename_map if resolved else {}
+        mapped_sources = {source.removeprefix("observation.images.") for source in rename_map}
+        mapped_targets = set(rename_map.values())
+        mapping_valid = (
+            bool(rename_map)
+            and mapped_sources.issubset(robot_roles)
+            and mapped_targets.issubset(expected_visuals)
+            and len(mapped_targets) == len(rename_map)
+            and len(expected_visuals - mapped_targets) <= policy.empty_cameras
+        )
+        checks.append(
+            _check(
+                "policy.camera_mapping",
+                "Policy camera mapping",
+                mapping_valid,
+                (
+                    f"Robot cameras {sorted(mapped_sources)} map to policy features "
+                    f"{sorted(mapped_targets)}; {policy.empty_cameras} empty camera(s) allowed."
+                ),
+                (
+                    f"Camera mapping is incompatible. Robot roles: {sorted(robot_roles)}; "
+                    f"policy visuals: {sorted(expected_visuals)}; mapping: {rename_map}; "
+                    f"empty cameras allowed: {policy.empty_cameras}."
+                ),
             )
         )
         return checks
@@ -888,7 +1091,7 @@ class SafetyService:
             except CameraError:
                 missing.append(f"{name} (not connected)")
                 continue
-            cameras[name] = self.cameras.lerobot_config(camera, path)
+            cameras[name] = self.cameras.lerobot_config(camera, path, preview_name=name)
 
         if not missing:
             resolved.camera_profile_ids = mapping
@@ -898,7 +1101,10 @@ class SafetyService:
             "Camera mapping",
             not missing,
             f"{len(cameras)} camera role(s) resolved to a live device: "
-            + ", ".join(f"{name}={config['index_or_path']}" for name, config in cameras.items()),
+            + ", ".join(
+                f"{name}={config.get('unique_id', config.get('index_or_path', 'unknown'))}"
+                for name, config in cameras.items()
+            ),
             f"Unresolved camera role(s): {', '.join(missing)}.",
         )
 

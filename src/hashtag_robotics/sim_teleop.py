@@ -291,6 +291,7 @@ class RecordingPlan:
 
     repo_id: str
     task: str
+    tasks: list[str] | None = None
     root: str | None = None
     episodes: int = 1
     episode_time_s: float = 30.0
@@ -315,12 +316,12 @@ def run_teleop(
     leader: Any,
     arm: SimArm,
     mapping: LeaderMapping,
-    seconds: float,
+    seconds: float | None,
     fps: int,
     live: LiveFrames | None = None,
     viewer: Any = None,
 ) -> dict[str, Any]:
-    """Drive the simulated arm from the leader for a while.
+    """Drive the simulated arm until its deadline or an operator interrupt.
 
     Nothing physical moves: the follower is not opened, and the leader is only
     read -- the same read that identification does. A simulated session cannot
@@ -331,10 +332,10 @@ def run_teleop(
 
     period = 1 / max(1, fps)
     substeps = max(1, round(arm.physics_hz / max(1, fps)))
-    deadline = _time.monotonic() + seconds
+    deadline = None if seconds is None else _time.monotonic() + seconds
     loops: list[float] = []
     ticks = 0
-    while _time.monotonic() < deadline:
+    while deadline is None or _time.monotonic() < deadline:
         started = _time.monotonic()
         action = leader.get_action()
         targets = mapping.to_sim(action)
@@ -359,14 +360,15 @@ def run_teleop(
     return {"ticks": ticks, "mean_loop_ms": round(average, 3)}
 
 
-# What an operator can ask for mid-recording, as the dashboard already sends it:
-# the same escape sequences `lerobot-record` listens for, so one set of buttons
-# drives both recorders.
+# What an operator can ask for mid-recording.  LeRobot documents the one-byte
+# n/r/q aliases specifically for reliable remote control; legacy arrow/Escape
+# sequences remain accepted so older clients do not break.
 END_EPISODE = "end_episode"
 RERECORD_EPISODE = "rerecord_episode"
 STOP_RECORDING = "stop_recording"
 
 _SEQUENCES = {b"\x1b[C": END_EPISODE, b"\x1b[D": RERECORD_EPISODE}
+_SINGLE_BYTES = {b"n": END_EPISODE, b"r": RERECORD_EPISODE, b"q": STOP_RECORDING}
 
 
 def decode_episode_keys(buffer: bytes, *, flush: bool = False) -> tuple[list[str], bytes]:
@@ -380,6 +382,11 @@ def decode_episode_keys(buffer: bytes, *, flush: bool = False) -> tuple[list[str
     """
     actions: list[str] = []
     while buffer:
+        single = _SINGLE_BYTES.get(buffer[0:1].lower())
+        if single is not None:
+            actions.append(single)
+            buffer = buffer[1:]
+            continue
         if buffer[0:1] != b"\x1b":
             buffer = buffer[1:]
             continue
@@ -438,6 +445,32 @@ class EpisodeKeyReader:
         return actions
 
 
+def wait_for_episode_advance(keys: EpisodeKeyReader, seconds: float) -> bool:
+    """Wait for Space/right-arrow during reset; return True only for stop."""
+    import time as _time
+
+    deadline = _time.monotonic() + max(0.0, seconds)
+    while _time.monotonic() < deadline:
+        for request in keys.poll():
+            _emit_recording_control_ack(request)
+            if request == STOP_RECORDING:
+                return True
+            if request == END_EPISODE:
+                return False
+        _time.sleep(0.05)
+    return False
+
+
+def _emit_recording_control_ack(request: str) -> None:
+    """Use LeRobot's own messages so one telemetry parser serves both recorders."""
+    if request == END_EPISODE:
+        _emit("Right arrow key pressed. Exiting loop...")
+    elif request == RERECORD_EPISODE:
+        _emit("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+    elif request == STOP_RECORDING:
+        _emit("Escape key pressed. Stopping data recording...")
+
+
 def record(
     plan: RecordingPlan,
     leader: Any,
@@ -492,6 +525,7 @@ def record(
             started = _time.monotonic()
             ending = False
             for request in keys.poll():
+                _emit_recording_control_ack(request)
                 if request == RERECORD_EPISODE:
                     rerecord = True
                 elif request == STOP_RECORDING:
@@ -518,7 +552,7 @@ def record(
                     mapping.to_leader_units(arm.joint_positions()), dtype=np.float32
                 ),
                 # LeRobot 0.6 carries the task inside the frame, not beside it.
-                "task": plan.task,
+                "task": plan.tasks[episode] if plan.tasks else plan.task,
             }
             images = arm.frames()
             for name, image in images.items():
@@ -548,7 +582,7 @@ def record(
             _emit(f"Re-record episode {episode}: the operator asked for this take again")
             if plan.reset_time_s > 0:
                 _emit("Reset the environment")
-                _time.sleep(plan.reset_time_s)
+                stopping = wait_for_episode_advance(keys, plan.reset_time_s)
             continue
 
         succeeded = cube_is_in_bin(arm)
@@ -562,14 +596,16 @@ def record(
             dataset.clear_episode_buffer()
             _emit(f"Episode {episode} had no frames, so nothing was saved")
         else:
+            _emit(f"Hashtag recorder: Encoding episode {episode}")
             dataset.save_episode()
             saved += 1
+            _emit(f"Hashtag recorder: Saved episode {episode}")
             _emit(f"Episode {episode} saved ({frames} frames, success={succeeded})")
 
         episode += 1
         if not stopping and episode < plan.episodes and plan.reset_time_s > 0:
             _emit("Reset the environment")
-            _time.sleep(plan.reset_time_s)
+            stopping = wait_for_episode_advance(keys, plan.reset_time_s)
 
     if stopping:
         _emit(f"Stopped by the operator after {saved} episode(s)")

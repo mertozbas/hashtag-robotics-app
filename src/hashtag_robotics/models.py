@@ -61,6 +61,7 @@ class JobKind(StrEnum):
     DATASET_VALIDATE = "dataset_validate"
     DATASET_TRANSFORM = "dataset_transform"
     TRAINING = "training"
+    POLICY_IMPORT = "policy_import"
     EVALUATION = "evaluation"
     POLICY_ROLLOUT = "policy_rollout"
     SIMULATION = "simulation"
@@ -254,6 +255,7 @@ class SetupSlot(StrictModel):
     calibration_valid: bool | None = None
     calibration_warnings: list[str] = Field(default_factory=list)
     motor_count: int = 0
+    max_relative_target: float | None = None
 
 
 class SetupStatus(StrictModel):
@@ -403,12 +405,15 @@ class PolicyManifest(StrictModel):
     policy_type: str
     checkpoint: str | None = None
     checkpoint_step: int | None = None
+    model_repo_id: str | None = None
+    model_revision: str | None = None
     source_dataset_id: str | None = None
     source_repo_id: str | None = None
     expected_features: list[str] = Field(default_factory=list)
     processor_chain: list[str] = Field(default_factory=list)
     action_shape: list[int] = Field(default_factory=lambda: [6])
     camera_mapping: dict[str, str] = Field(default_factory=dict)
+    empty_cameras: int = Field(default=0, ge=0)
     runtime: str = "local"
     training_steps: int | None = None
     compatibility_status: str = "unverified"
@@ -569,6 +574,10 @@ class ResolvedTargets(StrictModel):
     teleop_calibration_revision: str | None = None
     camera_profile_ids: dict[str, str] = Field(default_factory=dict)
     cameras: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    policy_id: str | None = None
+    policy_checkpoint: str | None = None
+    policy_revision: str | None = None
+    rename_map: dict[str, str] = Field(default_factory=dict)
     max_relative_target: float | None = None
     action_shape: list[int] = Field(default_factory=list)
 
@@ -588,6 +597,10 @@ class ResolvedTargets(StrictModel):
         parameters = {key: getattr(self, key) for key in keys if getattr(self, key) is not None}
         if self.cameras:
             parameters["cameras"] = self.cameras
+        if self.policy_checkpoint:
+            parameters["policy_path"] = self.policy_checkpoint
+        if self.rename_map:
+            parameters["rename_map"] = self.rename_map
         return parameters
 
     def resource_requests(self, kind: JobKind | None = None) -> list[ResourceRequest]:
@@ -681,6 +694,13 @@ class SafetyCheck(StrictModel):
     label: str
     status: CheckStatus
     message: str
+
+
+class PhysicalGateRequest(StrictModel):
+    """An explicit, session-scoped operator decision about real actuation."""
+
+    enabled: bool
+    confirmed: bool = False
 
 
 class PreflightResult(StrictModel):

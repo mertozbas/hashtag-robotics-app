@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -54,6 +55,52 @@ def write_dataset(root: Path, *, info: dict[str, Any] | None = None, complete: b
     return directory
 
 
+def write_episode_contract(
+    directory: Path,
+    *,
+    tasks: list[str],
+    video_seconds: list[float] | None = None,
+) -> None:
+    import pandas as pd
+
+    video_seconds = video_seconds or [40 / 30] * len(tasks)
+    cumulative = [0.0]
+    for duration in video_seconds:
+        cumulative.append(cumulative[-1] + duration)
+
+    rows = []
+    for index, task in enumerate(tasks):
+        row: dict[str, Any] = {
+            "episode_index": index,
+            "tasks": [task],
+            "length": 40,
+        }
+        for feature in ("observation.images.front", "observation.images.wrist"):
+            prefix = f"videos/{feature}"
+            row[f"{prefix}/chunk_index"] = 0
+            row[f"{prefix}/file_index"] = 0
+            row[f"{prefix}/from_timestamp"] = cumulative[index]
+            row[f"{prefix}/to_timestamp"] = cumulative[index + 1]
+        rows.append(row)
+
+    episodes = directory / "meta" / "episodes" / "chunk-000"
+    episodes.mkdir(parents=True)
+    pd.DataFrame(rows).to_parquet(episodes / "file-000.parquet", index=False)
+    (directory / "meta" / "hashtag_episode_plan.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {
+                    "dataset_episode_index": index,
+                    "global_episode": index + 1,
+                    "instruction": task,
+                }
+            )
+            + "\n"
+            for index, task in enumerate(tasks)
+        )
+    )
+
+
 @pytest.fixture
 def store(tmp_path: Path) -> DatasetStore:
     settings = Settings(data_dir=tmp_path / "state", open_browser=False)
@@ -79,6 +126,43 @@ def test_a_complete_dataset_is_verified_from_its_files(store: DatasetStore, tmp_
     assert report["action_shape"] == [6]
     assert report["files"]["data_parquet"] == 1
     assert report["files"]["videos"]["observation.images.front"] == 1
+
+
+def test_episode_plan_and_video_windows_are_part_of_integrity(
+    store: DatasetStore,
+) -> None:
+    directory = write_dataset(store.settings.lerobot_home)
+    write_episode_contract(
+        directory,
+        tasks=["first", "wrong second", "third"],
+        video_seconds=[40 / 30, 10.0, 40 / 30],
+    )
+    sidecar = directory / "meta" / "hashtag_episode_plan.jsonl"
+    planned = [json.loads(line) for line in sidecar.read_text().splitlines()]
+    planned[1]["instruction"] = "second"
+    sidecar.write_text("".join(json.dumps(row) + "\n" for row in planned))
+
+    report = store.inspect(REPO_ID)
+
+    assert report["integrity_status"] == "incomplete"
+    assert report["episode_audit"]["task_mismatches"] == [1]
+    assert {mismatch["camera"] for mismatch in report["episode_audit"]["video_mismatches"]} == {
+        "observation.images.front",
+        "observation.images.wrist",
+    }
+    problems = " ".join(report["problems"])
+    assert "task mismatch" in problems
+    assert "10.000s" in problems
+
+
+def test_a_matching_episode_contract_is_verified(store: DatasetStore) -> None:
+    directory = write_dataset(store.settings.lerobot_home)
+    write_episode_contract(directory, tasks=["first", "second", "third"])
+
+    report = store.inspect(REPO_ID)
+
+    assert report["integrity_status"] == "verified"
+    assert report["episode_audit"]["problems"] == []
 
 
 def test_metadata_without_data_files_is_incomplete(store: DatasetStore) -> None:
@@ -247,6 +331,61 @@ def test_the_policy_manifest_maps_its_own_camera_features(
     assert "action" in manifest.expected_features
 
 
+def test_a_hub_policy_is_downloaded_at_a_pinned_revision_and_registered(
+    policies: PolicyStore,
+    monkeypatch,
+) -> None:
+    revision = "a" * 40
+    monkeypatch.setattr("hashtag_robotics.policy.get_token", lambda: "hf_test_credential")
+    monkeypatch.setattr(
+        "hashtag_robotics.policy.model_info",
+        lambda *args, **kwargs: SimpleNamespace(sha=revision),
+    )
+
+    def fake_download(*, local_dir: Path, ignore_patterns: list[str], **kwargs) -> str:
+        assert "checkpoints/**" in ignore_patterns
+        local_dir = Path(local_dir)
+        local_dir.mkdir(parents=True)
+        config = {
+            **POLICY_CONFIG,
+            "type": "smolvla",
+            "input_features": {
+                "observation.state": {"shape": [6]},
+                "observation.images.camera1": {"shape": [3, 256, 256]},
+                "observation.images.camera2": {"shape": [3, 256, 256]},
+                "observation.images.camera3": {"shape": [3, 256, 256]},
+                "observation.images.empty_camera_0": {"shape": [3, 480, 640]},
+            },
+            "empty_cameras": 1,
+        }
+        (local_dir / "config.json").write_text(json.dumps(config))
+        (local_dir / "model.safetensors").write_bytes(b"weights")
+        (local_dir / "policy_preprocessor.json").write_text("{}")
+        (local_dir / "policy_postprocessor.json").write_text("{}")
+        return str(local_dir)
+
+    monkeypatch.setattr("hashtag_robotics.policy.snapshot_download", fake_download)
+
+    manifest = policies.import_from_hub(
+        "HashtagRobotics/tic-tac-toe",
+        name="Tic-Tac-Toe 80K",
+        camera_mapping={
+            "observation.images.top": "observation.images.camera1",
+            "observation.images.wrist": "observation.images.camera2",
+        },
+    )
+
+    assert manifest.model_revision == revision
+    assert manifest.model_repo_id == "HashtagRobotics/tic-tac-toe"
+    assert manifest.compatibility_status == "hub-checkpoint-read"
+    assert manifest.empty_cameras == 1
+    assert manifest.action_shape == [6]
+    assert "observation.images.empty_camera_0" not in manifest.expected_features
+    assert manifest.checkpoint is not None
+    assert Path(manifest.checkpoint).is_relative_to(policies.settings.policy_dir)
+    assert (Path(manifest.checkpoint) / "model.safetensors").is_file()
+
+
 def test_dataset_validation_rereads_the_disk(client: TestClient, tmp_path: Path) -> None:
     directory = write_dataset(tmp_path / "lerobot-data")
     created = client.post(
@@ -359,3 +498,31 @@ def test_resolve_falls_back_to_the_requested_name_when_nothing_exists(
     store: DatasetStore,
 ) -> None:
     assert store.resolve_recorded("mertkirgil/nothing") == "mertkirgil/nothing"
+
+
+def test_recording_status_separates_saved_episodes_from_the_current_buffer(
+    store: DatasetStore,
+) -> None:
+    requested = "hashtagrobotics/tic-tac-toe-so101"
+    stamped = f"{requested}_20260814_162030"
+    directory = store.settings.lerobot_home / stamped
+    (directory / "meta").mkdir(parents=True)
+    (directory / "meta" / "info.json").write_text(
+        json.dumps({"total_episodes": 2, "total_frames": 900, "fps": 30})
+    )
+    for role, count in (("top", 17), ("wrist", 16)):
+        episode = directory / "images" / f"observation.images.{role}" / "episode-000002"
+        episode.mkdir(parents=True)
+        for index in range(count):
+            (episode / f"frame-{index:06d}.png").touch()
+
+    status = store.recording_status(requested)
+
+    assert status["recorded_repo_id"] == stamped
+    assert status["saved_episodes"] == 2
+    assert status["saved_frames"] == 900
+    assert status["buffered_frames"] == 16
+    assert status["buffered_frames_by_camera"] == {
+        "observation.images.top": 17,
+        "observation.images.wrist": 16,
+    }

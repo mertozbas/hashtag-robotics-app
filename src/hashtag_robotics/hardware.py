@@ -22,6 +22,7 @@ from hashtag_robotics.models import (
 from hashtag_robotics.process import ManagedProcess
 from hashtag_robotics.repository import Repository
 from hashtag_robotics.telemetry import TelemetryBuffer, TelemetryParser, strip_ansi
+from hashtag_robotics.tic_tac_toe import is_tic_tac_toe_parameters
 
 ProgressCallback = Callable[[float, str], Awaitable[None]]
 CancelCheck = Callable[[], bool]
@@ -38,6 +39,29 @@ AUTO_CONFIRM_EXCLUDED = {JobKind.CALIBRATION, JobKind.MOTOR_SETUP}
 # One arm, one prompt; a follower plus a leader is two. The cap keeps a
 # misparsed line from turning into a stream of keystrokes.
 MAX_AUTO_CONFIRMATIONS = 2
+
+# These sessions intentionally have no wall-clock end. The operator owns their
+# lifetime through the safe cancel path (SIGINT -> LeRobot disconnect -> torque
+# off), while the emergency stop remains available independently.
+MANUAL_STOP_JOB_KINDS = {JobKind.TELEOPERATION, JobKind.SIM_TELEOPERATION}
+
+
+def execution_timeout_seconds(job: JobRecord, default_seconds: int) -> float | None:
+    """Resolve the watchdog without turning a manual session into a timer."""
+    if job.kind == JobKind.POLICY_ROLLOUT and is_tic_tac_toe_parameters(job.parameters):
+        # The dashboard owns this session through its acknowledged q control;
+        # safe cancel and E-STOP remain independent. A wall clock must not end a
+        # move while the operator is still watching the arm.
+        return None
+    requested = job.parameters.get("timeout_seconds")
+    if requested is not None:
+        value = float(requested)
+        if value <= 0:
+            raise PhysicalExecutionError("timeout_seconds must be greater than zero.")
+        return value
+    if job.kind in MANUAL_STOP_JOB_KINDS:
+        return None
+    return float(default_seconds)
 
 
 def resolve_command(name: str) -> str | None:
@@ -144,13 +168,20 @@ class LeRobotCommandBuilder:
             # and one more: MuJoCo's renderer has already taken this board's
             # control plane down once, and this command also opens a serial port.
             recording = request.kind == JobKind.SIM_RECORDING
+            if recording:
+                self._validate_episode_tasks(parameters)
+            session_seconds = (
+                float(parameters.get("episode_time_s", 30))
+                if recording
+                else float(parameters.get("teleop_time_s", 0))
+            )
             args = [
                 f"--leader-port={self._required(parameters, 'teleop_port')}",
                 f"--leader-id={parameters.get('teleop_id', DEFAULT_TELEOPERATOR_ID)}",
                 f"--repo-id={parameters.get('repo_id', 'local/sim_session')}",
                 f"--task={parameters.get('task', 'simulated demonstration')}",
                 f"--episodes={int(parameters.get('episodes', 1))}",
-                f"--episode-time-s={float(parameters.get('episode_time_s', 30))}",
+                f"--episode-time-s={session_seconds}",
                 f"--reset-time-s={float(parameters.get('reset_time_s', 3))}",
                 f"--fps={int(parameters.get('fps', 30))}",
                 f"--width={int(parameters.get('width', 640))}",
@@ -228,6 +259,7 @@ class LeRobotCommandBuilder:
             )
 
         if request.kind == JobKind.RECORDING:
+            self._validate_episode_tasks(parameters)
             args = [
                 *self._robot_arguments(parameters),
                 *self._teleoperator_arguments(parameters),
@@ -237,7 +269,11 @@ class LeRobotCommandBuilder:
                 f"--display_data={self._flag(parameters.get('display_data', False))}",
             ]
             return CommandPlan(
-                executable="lerobot-record",
+                executable=(
+                    "hashtag-lerobot-record"
+                    if self._uses_avfoundation_uid(parameters) or parameters.get("episode_tasks")
+                    else "lerobot-record"
+                ),
                 arguments=tuple(args),
                 required_parameters=(
                     "robot_port",
@@ -278,6 +314,7 @@ class LeRobotCommandBuilder:
 
         if request.kind in {JobKind.EVALUATION, JobKind.POLICY_ROLLOUT}:
             strategy = str(parameters.get("strategy", "episodic"))
+            tic_tac_toe = is_tic_tac_toe_parameters(parameters)
             args = [
                 *self._robot_arguments(parameters),
                 f"--policy.path={self._required(parameters, 'policy_path')}",
@@ -287,9 +324,33 @@ class LeRobotCommandBuilder:
                 f"--play_sounds={self._flag(parameters.get('play_sounds', False))}",
                 f"--display_data={self._flag(parameters.get('display_data', False))}",
             ]
+            if tic_tac_toe:
+                args.extend(
+                    [
+                        "--strategy.reset_to_initial_position=true",
+                        f"--inference.type={parameters.get('inference_type', 'rtc')}",
+                        "--inference.queue_threshold="
+                        + str(int(parameters.get("inference_queue_threshold", 18))),
+                        "--inference.rtc.enabled="
+                        + self._flag(parameters.get("inference_rtc_enabled", False)),
+                        "--return_to_initial_position=true",
+                    ]
+                )
+            rename_map = parameters.get("rename_map")
+            if isinstance(rename_map, dict) and rename_map:
+                args.append(
+                    "--rename_map=" + json.dumps(rename_map, separators=(",", ":"), sort_keys=True)
+                )
             required = ["robot_port", "robot_id", "policy_path"]
             if strategy in RECORDING_STRATEGIES:
                 args.extend(self._dataset_arguments(parameters))
+                if parameters.get("dataset_video") is not None:
+                    args.append(f"--dataset.video={self._flag(parameters.get('dataset_video'))}")
+                if parameters.get("video_encoding_batch_size") is not None:
+                    args.append(
+                        "--dataset.video_encoding_batch_size="
+                        + str(int(parameters["video_encoding_batch_size"]))
+                    )
                 required.append("repo_id")
             else:
                 args.append(f"--duration={float(parameters.get('duration', 30))}")
@@ -297,7 +358,11 @@ class LeRobotCommandBuilder:
             if device:
                 args.append(f"--device={device}")
             return CommandPlan(
-                executable="lerobot-rollout",
+                executable=(
+                    "hashtag-lerobot-rollout"
+                    if tic_tac_toe or self._uses_avfoundation_uid(parameters)
+                    else "lerobot-rollout"
+                ),
                 arguments=tuple(args),
                 required_parameters=tuple(required),
                 description="Run a guarded real policy rollout.",
@@ -311,6 +376,28 @@ class LeRobotCommandBuilder:
 
     def _role(self, parameters: dict[str, Any]) -> str:
         return str(parameters.get("role", "robot"))
+
+    @staticmethod
+    def _uses_avfoundation_uid(parameters: dict[str, Any]) -> bool:
+        cameras = parameters.get("cameras")
+        return isinstance(cameras, dict) and any(
+            isinstance(config, dict) and config.get("type") == "avfoundation_uid"
+            for config in cameras.values()
+        )
+
+    @staticmethod
+    def _validate_episode_tasks(parameters: dict[str, Any]) -> None:
+        episode_tasks = parameters.get("episode_tasks")
+        if episode_tasks is None:
+            return
+        if not isinstance(episode_tasks, list) or not episode_tasks:
+            raise PhysicalExecutionError("episode_tasks must be a non-empty list.")
+        if any(not isinstance(task, str) or not task.strip() for task in episode_tasks):
+            raise PhysicalExecutionError("Every planned episode needs a non-empty task.")
+        if len(episode_tasks) != int(parameters.get("episodes", 1)):
+            raise PhysicalExecutionError(
+                "episode_tasks count must match the requested episode count."
+            )
 
     def _device_arguments(self, parameters: dict[str, Any]) -> tuple[list[str], tuple[str, ...]]:
         if self._role(parameters) == "teleoperator":
@@ -341,6 +428,8 @@ class LeRobotCommandBuilder:
         max_relative_target = parameters.get("max_relative_target")
         if include_limits and max_relative_target is not None:
             args.append(f"--robot.max_relative_target={float(max_relative_target)}")
+        if parameters.get("disable_torque_on_disconnect"):
+            args.append("--robot.disable_torque_on_disconnect=true")
         return args
 
     def _teleoperator_arguments(self, parameters: dict[str, Any]) -> list[str]:
@@ -397,10 +486,54 @@ class LeRobotCliAdapter:
             "lerobot-replay",
             "lerobot-rollout",
         }
+        if sys.platform == "darwin":
+            required.update({"hashtag-lerobot-record", "hashtag-lerobot-rollout"})
         return all(resolve_command(command) for command in required)
 
-    def environment(self) -> dict[str, str]:
-        return {"HF_LEROBOT_HOME": str(self.settings.lerobot_home)}
+    def environment(self, job: JobRecord | None = None) -> dict[str, str]:
+        environment = {"HF_LEROBOT_HOME": str(self.settings.lerobot_home)}
+        camera_jobs = {JobKind.RECORDING, JobKind.EVALUATION, JobKind.POLICY_ROLLOUT}
+        if job is not None and job.kind in camera_jobs:
+            live_dir = self.settings.recording_live_root / job.id
+            live_dir.mkdir(parents=True, exist_ok=True)
+            environment["HASHTAG_RECORDING_LIVE_DIR"] = str(live_dir)
+        if job is not None and job.kind in {JobKind.RECORDING, JobKind.SIM_RECORDING}:
+            episode_tasks = job.parameters.get("episode_tasks")
+            if isinstance(episode_tasks, list) and episode_tasks:
+                environment["HASHTAG_EPISODE_TASKS_JSON"] = json.dumps(
+                    episode_tasks,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+        if job is not None and job.kind == JobKind.RECORDING:
+            # Dashboard collection is deliberately operator-paced.  Numeric
+            # LeRobot timeouts must never advance or save an episode while the
+            # operator is still performing the task or resetting the scene.
+            environment["HASHTAG_MANUAL_RECORDING_CONTROL"] = "1"
+        if (
+            job is not None
+            and job.kind == JobKind.POLICY_ROLLOUT
+            and is_tic_tac_toe_parameters(job.parameters)
+        ):
+            preset = job.parameters.get("ttt_preset")
+            task = str(job.parameters.get("task", "")).strip()
+            if not isinstance(preset, dict) or not task:
+                raise PhysicalExecutionError(
+                    "The tic-tac-toe job lost its server-pinned preset or task."
+                )
+            environment.update(
+                {
+                    "HASHTAG_ASYNC_CHUNK_APPEND": "1",
+                    "HASHTAG_TTT_DEMO_PRESET_JSON": json.dumps(
+                        preset, ensure_ascii=False, separators=(",", ":")
+                    ),
+                    "HASHTAG_ROLLOUT_EPISODE_TASKS_JSON": json.dumps(
+                        [task], ensure_ascii=False, separators=(",", ":")
+                    ),
+                    "HASHTAG_UNBOUNDED_ROLLOUT": "1",
+                }
+            )
+        return environment
 
     def preview(self, request: JobCreateRequest) -> dict[str, Any]:
         plan = self.builder.build(request)
@@ -439,7 +572,7 @@ class LeRobotCliAdapter:
         managed = ManagedProcess(
             executable,
             plan.arguments,
-            self.environment(),
+            self.environment(job),
             interactive=plan.interactive,
         )
         parser = TelemetryParser()
@@ -453,8 +586,9 @@ class LeRobotCliAdapter:
 
         recent_output: list[str] = []
         loop = asyncio.get_running_loop()
-        timeout_seconds = int(job.parameters.get("timeout_seconds", self.settings.max_job_seconds))
+        timeout_seconds = execution_timeout_seconds(job, self.settings.max_job_seconds)
         episodes = max(1, int(job.parameters.get("episodes", 1)))
+        dataset_episode_start = max(0, int(job.parameters.get("dataset_episode_start", 0)))
         started = loop.time()
         published = 0.0
         confirmations = 0
@@ -464,7 +598,7 @@ class LeRobotCliAdapter:
                 if cancelled():
                     await managed.stop()
                     raise PhysicalExecutionError("Physical command was stopped by the operator.")
-                if loop.time() - started > timeout_seconds:
+                if timeout_seconds is not None and loop.time() - started > timeout_seconds:
                     await managed.stop()
                     raise PhysicalExecutionError("Physical command exceeded its safe timeout.")
 
@@ -480,14 +614,17 @@ class LeRobotCliAdapter:
                             confirmations += 1
                             managed.write_key(JobInputKey.ENTER)
                             await progress(
-                                self._progress(buffer, episodes),
+                                self._progress(buffer, episodes, dataset_episode_start),
                                 "Confirmed the bound calibration revision",
                             )
 
                 now = loop.time()
                 if recent_output and now - published >= 0.5:
                     published = now
-                    await progress(self._progress(buffer, episodes), recent_output[-1][:160])
+                    await progress(
+                        self._progress(buffer, episodes, dataset_episode_start),
+                        recent_output[-1][:160],
+                    )
 
             return_code = await managed.wait()
             # A command that fails on startup writes its whole reason and exits
@@ -516,6 +653,7 @@ class LeRobotCliAdapter:
             managed.close()
             self.processes.pop(job.id, None)
             self._persist_process(job.id, None)
+            shutil.rmtree(self.settings.recording_live_root / job.id, ignore_errors=True)
 
     def _should_auto_confirm(
         self,
@@ -565,6 +703,31 @@ class LeRobotCliAdapter:
             raise PhysicalExecutionError(f"Job '{job_id}' has no running physical command.")
         managed.write_key(key)
 
+    def latest_control_ack(self, job_id: str) -> dict[str, Any] | None:
+        control = self.telemetry_summary(job_id).get("control")
+        return control if isinstance(control, dict) else None
+
+    async def wait_for_control_ack(
+        self,
+        job_id: str,
+        key: JobInputKey,
+        previous_at: str | None,
+        timeout_seconds: float = 2.0,
+    ) -> dict[str, Any] | None:
+        """Wait until recorder stdout proves it applied this exact command."""
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        expected_phase = f"control:{key.value}"
+        while asyncio.get_running_loop().time() < deadline:
+            control = self.latest_control_ack(job_id)
+            if (
+                control is not None
+                and control.get("phase") == expected_phase
+                and control.get("at") != previous_at
+            ):
+                return control
+            await asyncio.sleep(0.05)
+        return None
+
     async def stop_all(self, grace_seconds: float = 1.0) -> list[str]:
         outcomes: list[str] = []
         for job_id, managed in list(self.processes.items()):
@@ -582,11 +745,17 @@ class LeRobotCliAdapter:
         job.process = record
         self.repository.update_job(job)
 
-    def _progress(self, buffer: TelemetryBuffer, episodes: int) -> float:
+    def _progress(
+        self,
+        buffer: TelemetryBuffer,
+        episodes: int,
+        dataset_episode_start: int = 0,
+    ) -> float:
         episode = buffer.latest(TelemetryKind.EPISODE)
         if episode is None or episode.episode is None:
             return 0.5
-        return min(0.95, (episode.episode + 1) / episodes)
+        relative_episode = max(0, episode.episode - dataset_episode_start)
+        return min(0.95, (relative_episode + 1) / episodes)
 
     def _redact(self, value: str) -> str:
         lowered = value.lower()

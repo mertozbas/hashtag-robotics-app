@@ -3,6 +3,8 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import webbrowser
@@ -27,6 +29,45 @@ app = typer.Typer(
 )
 
 
+def _build_dashboard_from_checkout(project_root: Path | None = None) -> bool:
+    """Build the React dashboard when serving directly from a source checkout.
+
+    Wheels carry prebuilt assets and do not carry ``frontend/``. A checkout
+    carries both, which creates a dangerous third state: Python can be current
+    while an older ignored ``web/assets`` directory is still being served. In
+    that state controls appear to vanish even though their source exists.
+
+    Node is intentionally optional for deployed robot hosts. If it is absent,
+    keep the packaged/prebuilt dashboard; if it is present in a checkout, a
+    failed build must stop startup rather than silently serve stale controls.
+    """
+    root = project_root or Path(__file__).resolve().parents[2]
+    frontend = root / "frontend"
+    if not (frontend / "package.json").is_file():
+        return False
+    npm = shutil.which("npm")
+    if npm is None:
+        typer.echo(
+            "Frontend source found but npm is unavailable; serving the existing dashboard build.",
+            err=True,
+        )
+        return False
+    typer.echo("Building the dashboard from the current frontend source...")
+    result = subprocess.run(
+        [npm, "--prefix", str(frontend), "run", "build"],
+        cwd=root,
+        check=False,
+    )
+    if result.returncode != 0:
+        typer.echo(
+            "Dashboard build failed; refusing to serve stale frontend assets. "
+            "Run 'npm install --prefix frontend' and retry.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    return True
+
+
 def _serve() -> None:
     settings = get_settings()
     if settings.enable_physical and not settings.binds_to_loopback:
@@ -37,6 +78,7 @@ def _serve() -> None:
             err=True,
         )
         raise typer.Exit(code=2)
+    _build_dashboard_from_checkout()
     if settings.open_browser:
         threading.Timer(
             0.9,
@@ -246,6 +288,17 @@ def sim_record(
     cannot injure anyone or overload a servo.
     """
     settings = get_settings()
+    episode_tasks: list[str] | None = None
+    raw_episode_tasks = os.environ.get("HASHTAG_EPISODE_TASKS_JSON")
+    if raw_episode_tasks:
+        parsed_tasks = json.loads(raw_episode_tasks)
+        if not isinstance(parsed_tasks, list) or len(parsed_tasks) != episodes:
+            raise typer.BadParameter(
+                "HASHTAG_EPISODE_TASKS_JSON must contain one task per requested episode."
+            )
+        episode_tasks = [str(item).strip() for item in parsed_tasks]
+        if any(not item for item in episode_tasks):
+            raise typer.BadParameter("Every planned episode needs a non-empty task.")
     try:
         wanted = tuple(name.strip() for name in cameras.split(",") if name.strip())
         scene = sim_scene.build(
@@ -266,13 +319,20 @@ def sim_record(
             window = sim_teleop.open_session_viewer(arm)
         if teleop_only:
             result = sim_teleop.run_teleop(
-                leader, arm, mapping, episode_time_s, fps, live=live, viewer=window
+                leader,
+                arm,
+                mapping,
+                None if episode_time_s <= 0 else episode_time_s,
+                fps,
+                live=live,
+                viewer=window,
             )
         else:
             result = sim_teleop.record(
                 sim_teleop.RecordingPlan(
                     repo_id=repo_id,
                     task=task,
+                    tasks=episode_tasks,
                     root=root,
                     episodes=episodes,
                     episode_time_s=episode_time_s,

@@ -109,6 +109,27 @@ def wait_for(probe: Callable[[], Any], timeout: float = 25.0) -> Any:
     raise AssertionError("The expected control plane state never arrived.")
 
 
+def valid_calibration() -> dict[str, dict[str, int]]:
+    names = (
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow_flex",
+        "wrist_flex",
+        "wrist_roll",
+        "gripper",
+    )
+    return {
+        name: {
+            "id": index,
+            "drive_mode": 0,
+            "homing_offset": 0,
+            "range_min": 500,
+            "range_max": 3500,
+        }
+        for index, name in enumerate(names, start=1)
+    }
+
+
 def test_a_slot_holds_one_arm_and_derives_its_lerobot_id(lab: TestClient) -> None:
     response = assign(lab, "follower", "SO101FOLLOWER")
     assert response.status_code == 200
@@ -119,10 +140,34 @@ def test_a_slot_holds_one_arm_and_derives_its_lerobot_id(lab: TestClient) -> Non
     assert follower["device_serial"] == "SO101FOLLOWER"
     # The operator never types this; a mistyped id silently breaks calibration.
     assert follower["lerobot_id"] == "follower01"
+    assert follower["max_relative_target"] == 10.0
     assert slot(status, "leader")["profile_id"] is None
 
     real = [item for item in lab.get("/api/robots").json() if item["target_mode"] != "sim"]
     assert len(real) == 1
+
+
+def test_follower_limit_can_be_tuned_without_losing_profile_bindings(lab: TestClient) -> None:
+    assign(lab, "follower", "SO101FOLLOWER")
+    robot = next(item for item in lab.get("/api/robots").json() if item["target_mode"] != "sim")
+    saved = lab.post(
+        "/api/robots",
+        json={**robot, "camera_mapping": {"wrist": "camera_so101"}},
+    )
+    assert saved.status_code == 200
+
+    changed = lab.post("/api/setup/follower-limit", json={"max_relative_target": 12})
+    assert changed.status_code == 200
+    assert slot(changed.json(), "follower")["max_relative_target"] == 12.0
+
+    updated = next(item for item in lab.get("/api/robots").json() if item["target_mode"] != "sim")
+    assert updated["safety_profile"]["max_relative_target"] == 12.0
+    assert updated["camera_mapping"] == {"wrist": "camera_so101"}
+
+    assert lab.post("/api/setup/follower-limit", json={"max_relative_target": 0}).status_code == 422
+    assert (
+        lab.post("/api/setup/follower-limit", json={"max_relative_target": 31}).status_code == 422
+    )
 
 
 def test_the_same_arm_cannot_fill_both_slots(lab: TestClient) -> None:
@@ -195,6 +240,60 @@ def test_saving_a_profile_cannot_clear_its_calibration_binding(lab: TestClient) 
     assert renamed.json()["name"] == "Sag kol"
     assert renamed.json()["calibration_revision"] == artifact.id
     assert renamed.json()["motor_layout"] == {"shoulder_pan": 1}
+
+
+def test_imported_calibrations_can_be_bound_to_setup_slots(
+    lab: TestClient,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    assign(lab, "follower", "SO101FOLLOWER")
+    assign(lab, "leader", "SO101LEADER")
+
+    home = tmp_path / "home"
+    root = home / "legacy-calibration"
+    follower = root / "robots" / "so_follower"
+    leader = root / "teleoperators" / "so_leader"
+    follower.mkdir(parents=True)
+    leader.mkdir(parents=True)
+    (follower / "mert_follower.json").write_text(json.dumps(valid_calibration()))
+    (leader / "mert_leader.json").write_text(json.dumps(valid_calibration()))
+    monkeypatch.setenv("HOME", str(home))
+
+    imported = lab.post("/api/calibrations/import", json={"directory": "~/legacy-calibration"})
+    assert imported.status_code == 200
+    artifacts = imported.json()
+    follower_artifact = next(item for item in artifacts if item["role"] == "follower")
+    leader_artifact = next(item for item in artifacts if item["role"] == "leader")
+
+    wrong_role = lab.post(
+        "/api/setup/calibrations/bind",
+        json={"role": "leader", "artifact_id": follower_artifact["id"]},
+    )
+    assert wrong_role.status_code == 422
+
+    follower_status = lab.post(
+        "/api/setup/calibrations/bind",
+        json={"role": "follower", "artifact_id": follower_artifact["id"]},
+    )
+    assert follower_status.status_code == 200
+    leader_status = lab.post(
+        "/api/setup/calibrations/bind",
+        json={"role": "leader", "artifact_id": leader_artifact["id"]},
+    )
+    assert leader_status.status_code == 200
+
+    status = leader_status.json()
+    assert slot(status, "follower")["lerobot_id"] == "mert_follower"
+    assert slot(status, "leader")["lerobot_id"] == "mert_leader"
+    assert slot(status, "follower")["calibration_revision"] == follower_artifact["id"]
+    assert slot(status, "leader")["calibration_revision"] == leader_artifact["id"]
+
+    robot = next(item for item in lab.get("/api/robots").json() if item["target_mode"] != "sim")
+    assert robot["calibration_verified"] is True
+    assert robot["motor_layout"] == {
+        name: index for index, name in enumerate(valid_calibration(), start=1)
+    }
 
 
 def test_setup_status_explains_every_blocked_step(lab: TestClient) -> None:

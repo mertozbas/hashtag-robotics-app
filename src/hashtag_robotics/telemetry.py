@@ -16,10 +16,36 @@ JOINT_ROW = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\|\s*(-?[0-9]+\.[0-9]+)$")
 RANGE_ROW = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\|\s*(-?\d+)\s*\|\s*(-?\d+)\s*\|\s*(-?\d+)$")
 
 EPISODE_PATTERN = re.compile(r"Recording episode\s+(\d+)")
+ENCODING_PATTERN = re.compile(r"Hashtag recorder: Encoding episode\s+(\d+)")
+DATASET_SAVED_PATTERN = re.compile(r"Hashtag recorder: Saved episode\s+(\d+)")
+CAMERA_INCIDENT_PATTERN = re.compile(
+    r"Hashtag camera incident:\s+generation=(\d+);\s+role=([^;]+);\s+reason=(.+)"
+)
+CAMERA_INVALIDATED_PATTERN = re.compile(
+    r"Hashtag recorder: Camera incident invalidated episode\s+(\d+)"
+)
+MANUAL_TAKE_PATTERN = re.compile(r"Hashtag recorder: Manual take gate armed")
+MANUAL_RESET_PATTERN = re.compile(r"Hashtag recorder: Manual reset gate armed")
+TTT_HOMING_PATTERN = re.compile(r"Demo episode\s+(\d+) başlangıç pozuna")
+TTT_HOME_READY_PATTERN = re.compile(r"Demo home hazır")
+TTT_INFERENCE_PATTERN = re.compile(r"Tahta onaylandı; model inference başlıyor")
+TTT_HOMING_FAILED_PATTERN = re.compile(r"Demo homing (?:başarısız|doğrulaması başarısız)")
 RESET_PATTERN = re.compile(r"Reset the environment")
 RERECORD_PATTERN = re.compile(r"Re-record episode")
 STOP_PATTERN = re.compile(r"Stop recording")
 SAVED_PATTERN = re.compile(r"Calibration saved to\s+(\S+)")
+
+# These lines are emitted by LeRobot only after its listener decoded the byte
+# and mutated the recording event flags.  They are therefore recorder ACKs,
+# unlike a successful HTTP response which proves only that a byte was written.
+CONTROL_ACK_PATTERNS = (
+    (re.compile(r"Right arrow key pressed\. Exiting loop"), JobInputKey.END_EPISODE),
+    (
+        re.compile(r"Left arrow key pressed\. Exiting loop and rerecord"),
+        JobInputKey.RERECORD_EPISODE,
+    ),
+    (re.compile(r"Escape key pressed\. Stopping data recording"), JobInputKey.STOP_RECORDING),
+)
 
 CHOICE_PROMPT = re.compile(r"type 'c' and press ENTER", re.IGNORECASE)
 ENTER_PROMPT = re.compile(r"press ENTER", re.IGNORECASE)
@@ -112,6 +138,72 @@ class TelemetryParser:
                 expects=JobInputKey.ENTER,
             )
 
+        for pattern, control in CONTROL_ACK_PATTERNS:
+            if pattern.search(text):
+                return TelemetrySample(
+                    kind=TelemetryKind.NOTICE,
+                    phase=f"control:{control.value}",
+                    message=text,
+                )
+
+        ttt_homing = TTT_HOMING_PATTERN.search(text)
+        if ttt_homing:
+            return TelemetrySample(
+                kind=TelemetryKind.NOTICE,
+                episode=int(ttt_homing.group(1)),
+                phase="ttt:homing",
+                message=text,
+            )
+        if TTT_HOMING_FAILED_PATTERN.search(text):
+            return TelemetrySample(
+                kind=TelemetryKind.NOTICE,
+                phase="ttt:homing_failed",
+                message=text,
+            )
+        if TTT_HOME_READY_PATTERN.search(text):
+            return TelemetrySample(
+                kind=TelemetryKind.NOTICE,
+                phase="ttt:home_ready",
+                message=text,
+            )
+        if TTT_INFERENCE_PATTERN.search(text):
+            return TelemetrySample(
+                kind=TelemetryKind.NOTICE,
+                phase="ttt:inference",
+                message=text,
+            )
+
+        camera_incident = CAMERA_INCIDENT_PATTERN.search(text)
+        if camera_incident:
+            return TelemetrySample(
+                kind=TelemetryKind.NOTICE,
+                phase="camera:incident",
+                message=(
+                    f"{camera_incident.group(2).strip()} camera stream stopped; "
+                    "the active take is invalid"
+                ),
+            )
+        camera_invalidated = CAMERA_INVALIDATED_PATTERN.search(text)
+        if camera_invalidated:
+            return TelemetrySample(
+                kind=TelemetryKind.NOTICE,
+                episode=int(camera_invalidated.group(1)),
+                phase="camera:take_invalidated",
+                message=text,
+            )
+        if MANUAL_TAKE_PATTERN.search(text):
+            return TelemetrySample(
+                kind=TelemetryKind.NOTICE,
+                phase="manual:take",
+                message=text,
+            )
+        if MANUAL_RESET_PATTERN.search(text):
+            return TelemetrySample(
+                kind=TelemetryKind.NOTICE,
+                phase="manual:reset",
+                message=text,
+            )
+
         episode = EPISODE_PATTERN.search(text)
         if episode:
             return TelemetrySample(
@@ -120,6 +212,18 @@ class TelemetryParser:
                 phase="recording",
                 message=text,
             )
+        for pattern, phase in (
+            (ENCODING_PATTERN, "encoding"),
+            (DATASET_SAVED_PATTERN, "saved"),
+        ):
+            match = pattern.search(text)
+            if match:
+                return TelemetrySample(
+                    kind=TelemetryKind.EPISODE,
+                    episode=int(match.group(1)),
+                    phase=phase,
+                    message=text,
+                )
         for pattern, phase in (
             (RERECORD_PATTERN, "rerecord"),
             (RESET_PATTERN, "reset"),
@@ -142,11 +246,26 @@ class TelemetryBuffer:
     def __init__(self, capacity: int = 240) -> None:
         self._samples: deque[TelemetrySample] = deque(maxlen=capacity)
         self._loop_ms: deque[float] = deque(maxlen=capacity)
+        # Lifecycle events must survive high-frequency joint/loop samples so
+        # the operator can audit the whole recording session in the dashboard.
+        self._events: deque[TelemetrySample] = deque(maxlen=64)
 
     def append(self, sample: TelemetrySample) -> None:
+        if sample.phase == "camera:incident":
+            current_episode = self.latest(TelemetryKind.EPISODE)
+            current_phase = current_episode.phase if current_episode is not None else None
+            if current_phase == "recording":
+                sample = sample.model_copy(update={"phase": "camera:incident_during_take"})
+            elif current_phase == "reset":
+                sample = sample.model_copy(update={"phase": "camera:incident_during_reset"})
         self._samples.append(sample)
         if sample.loop_ms is not None:
             self._loop_ms.append(sample.loop_ms)
+        if sample.kind == TelemetryKind.EPISODE or (
+            sample.kind == TelemetryKind.NOTICE
+            and (sample.phase or "").startswith(("control:", "camera:", "manual:", "ttt:"))
+        ):
+            self._events.append(sample)
 
     def latest(self, kind: TelemetryKind) -> TelemetrySample | None:
         for sample in reversed(self._samples):
@@ -159,6 +278,26 @@ class TelemetryBuffer:
         ranges = self.latest(TelemetryKind.CALIBRATION_RANGE)
         prompt = self.latest(TelemetryKind.PROMPT)
         episode = self.latest(TelemetryKind.EPISODE)
+        control = next(
+            (
+                sample
+                for sample in reversed(self._samples)
+                if sample.kind == TelemetryKind.NOTICE
+                and (sample.phase or "").startswith("control:")
+            ),
+            None,
+        )
+        if episode is not None and episode.episode is None:
+            numbered = next(
+                (
+                    sample
+                    for sample in reversed(self._samples)
+                    if sample.kind == TelemetryKind.EPISODE and sample.episode is not None
+                ),
+                None,
+            )
+            if numbered is not None:
+                episode = episode.model_copy(update={"episode": numbered.episode})
         return {
             "samples": len(self._samples),
             "p50_loop_ms": _percentile(self._loop_ms, 0.5),
@@ -167,6 +306,8 @@ class TelemetryBuffer:
             "ranges": ranges.ranges if ranges else {},
             "prompt": prompt.model_dump(mode="json") if prompt else None,
             "episode": episode.model_dump(mode="json") if episode else None,
+            "control": control.model_dump(mode="json") if control else None,
+            "events": [sample.model_dump(mode="json") for sample in self._events],
         }
 
 

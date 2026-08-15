@@ -1008,6 +1008,11 @@ ACTION_CATALOGUE: dict[str, dict[str, Any]] = {
 # the decision is written here rather than inferred from an absence. A reason
 # of "not offered yet" is a legitimate answer; silence is not.
 UNEXPOSED_JOB_KINDS: dict[JobKind, str] = {
+    JobKind.POLICY_IMPORT: (
+        "Withheld. Imports may download large remote checkpoints and require "
+        "private Hub credentials, so an operator must choose the repository "
+        "and revision explicitly through the local policy surface."
+    ),
     JobKind.MOTOR_SETUP: (
         "Withheld. Writes servo ids and baud rates onto a live bus, where a "
         "wrong id leaves an arm that no longer answers and the recovery is "

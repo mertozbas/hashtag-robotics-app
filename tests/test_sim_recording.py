@@ -130,6 +130,7 @@ def test_a_rehearsal_records_nothing() -> None:
     )
 
     assert "--teleop-only" in plan.arguments
+    assert "--episode-time-s=0.0" in plan.arguments
 
 
 def test_the_useless_scenarios_are_gone(client) -> None:

@@ -440,9 +440,16 @@ def test_the_episode_list_over_the_api(client) -> None:
                 "tasks": ["t"],
                 "stats/action/min": [0.0] * 6,
                 "stats/action/max": [0.0] * 6,
+                "videos/observation.images.wrist/chunk_index": 0,
+                "videos/observation.images.wrist/file_index": 0,
+                "videos/observation.images.wrist/from_timestamp": 2.5,
+                "videos/observation.images.wrist/to_timestamp": 5.0,
             }
         ]
     ).to_parquet(directory / "meta" / "episodes" / "chunk-000" / "file-000.parquet")
+    video = directory / "videos" / "observation.images.wrist" / "chunk-000" / "file-000.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"test-video")
     dataset_id = client.post(
         "/api/datasets",
         json={"name": "Takes", "repo_id": "takes", "task": "t", "local_path": str(directory)},
@@ -452,6 +459,20 @@ def test_the_episode_list_over_the_api(client) -> None:
 
     assert payload["readable"] is True
     assert payload["episodes"][0]["demonstrates_nothing"] is True
+    assert payload["episodes"][0]["videos"] == [
+        {
+            "camera": "wrist",
+            "feature": "observation.images.wrist",
+            "chunk_index": 0,
+            "file_index": 0,
+            "from_timestamp": 2.5,
+            "to_timestamp": 5.0,
+        }
+    ]
+
+    playback = client.get(f"/api/datasets/{dataset_id}/episodes/0/videos/wrist.mp4")
+    assert playback.status_code == 200
+    assert playback.content == b"test-video"
 
 
 def test_an_unlistable_recording_explains_itself(client) -> None:

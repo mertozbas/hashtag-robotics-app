@@ -25,6 +25,9 @@ DEGENERATE_RANGE = 1e-6
 # constant for that joint, and nothing said so. The threshold is in the same
 # normalised units the arm reports, where a full sweep is about 200.
 STILL_JOINT_RANGE = 1.0
+# Encoders can round a boundary by one frame. Anything beyond two frames is a
+# different take length, not container jitter.
+VIDEO_DURATION_TOLERANCE_FRAMES = 2
 
 
 class DatasetError(RuntimeError):
@@ -55,6 +58,44 @@ class DatasetStore:
         if root:
             return Path(root)
         return self.settings.lerobot_home / repo_id
+
+    def write_episode_plan(
+        self,
+        root: str | Path,
+        episodes: list[dict[str, Any]],
+        dataset_episode_start: int,
+    ) -> Path:
+        """Persist game/global episode lineage beside LeRobot's own metadata."""
+        directory = Path(root) / "meta"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "hashtag_episode_plan.jsonl"
+        indexed: dict[int, dict[str, Any]] = {}
+        if path.is_file():
+            for line in path.read_text().splitlines():
+                try:
+                    item = json.loads(line)
+                    indexed[int(item["dataset_episode_index"])] = item
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+
+        for offset, episode in enumerate(episodes):
+            if not isinstance(episode, dict) or not str(episode.get("instruction", "")).strip():
+                raise DatasetError("Every episode plan row needs a non-empty instruction.")
+            dataset_index = dataset_episode_start + offset
+            indexed[dataset_index] = {
+                "dataset_episode_index": dataset_index,
+                **episode,
+            }
+
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(
+            "".join(
+                json.dumps(indexed[index], ensure_ascii=False, separators=(",", ":")) + "\n"
+                for index in sorted(indexed)
+            )
+        )
+        temporary.replace(path)
+        return path
 
     def resolve_recorded(
         self,
@@ -138,6 +179,50 @@ class DatasetStore:
         # real recording.
         return modified >= started_at.timestamp() - 1
 
+    def recording_status(
+        self,
+        repo_id: str,
+        root: str | Path | None = None,
+        *,
+        started_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Read the durable and buffered parts of an in-progress recording.
+
+        LeRobot updates ``meta/info.json`` only after ``save_episode()`` and
+        keeps the current take as PNGs until it is encoded.  Reporting both is
+        the only honest answer while a session is live: a buffered take is not
+        yet a saved episode, while a saved episode remains recoverable even if
+        the session later aborts.
+        """
+        recorded_repo_id = self.resolve_recorded(repo_id, root, started_at=started_at)
+        directory = self.root_for(recorded_repo_id, root)
+        info_path = directory / "meta" / "info.json"
+        info: dict[str, Any] = {}
+        if info_path.is_file():
+            try:
+                info = json.loads(info_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                info = {}
+
+        image_root = directory / "images"
+        buffered_by_camera: dict[str, int] = {}
+        if image_root.is_dir():
+            for camera_dir in sorted(image_root.glob("observation.images.*")):
+                buffered_by_camera[camera_dir.name] = sum(1 for _ in camera_dir.rglob("*.png"))
+
+        aligned_buffered = min(buffered_by_camera.values()) if buffered_by_camera else 0
+        return {
+            "requested_repo_id": repo_id,
+            "recorded_repo_id": recorded_repo_id if info_path.is_file() else None,
+            "root": str(directory),
+            "saved_episodes": int(info.get("total_episodes", 0) or 0),
+            "saved_frames": int(info.get("total_frames", 0) or 0),
+            "buffered_frames": aligned_buffered,
+            "buffered_frames_by_camera": buffered_by_camera,
+            "fps": int(info.get("fps", 0) or 0),
+            "metadata_present": info_path.is_file(),
+        }
+
     def inspect(self, repo_id: str, root: str | Path | None = None) -> dict[str, Any]:
         directory = self.root_for(repo_id, root)
         info_path = directory / "meta" / "info.json"
@@ -184,8 +269,124 @@ class DatasetStore:
                 "files": self._count_files(directory, camera_keys),
             }
         )
+        episode_audit = self._episode_contract_audit(directory, info, camera_keys)
+        report["episode_audit"] = episode_audit
+        report["problems"].extend(episode_audit["problems"])
         report["integrity_status"] = self._grade(report)
         return report
+
+    def _episode_contract_audit(
+        self,
+        directory: Path,
+        info: dict[str, Any],
+        camera_keys: list[str],
+    ) -> dict[str, Any]:
+        """Compare the roadmap, embedded language and video windows.
+
+        File-existence checks cannot catch a semantically wrong demonstration:
+        the failed Game 1 run had every required file, but three Parquet task
+        labels were shifted and one 31.6 second take owned a 599.8 second video
+        window.  The roadmap sidecar is the intended contract; LeRobot episode
+        metadata is what a trainer actually consumes.
+        """
+        sidecar = directory / "meta" / "hashtag_episode_plan.jsonl"
+        episode_files = sorted((directory / "meta" / "episodes").rglob("*.parquet"))
+        problems: list[str] = []
+        task_mismatches: list[int] = []
+        video_mismatches: list[dict[str, Any]] = []
+        episodes = self.episodes("", directory) if episode_files else []
+        total_episodes = int(info.get("total_episodes", 0) or 0)
+        fps = int(info.get("fps", 0) or 0)
+
+        if episode_files:
+            indices = [int(item["index"]) for item in episodes]
+            expected_indices = list(range(total_episodes))
+            if indices != expected_indices:
+                problems.append(
+                    "Episode metadata indices do not match the continuous range "
+                    f"0..{max(total_episodes - 1, 0)}: found {indices}."
+                )
+
+            expected_cameras = set(camera_keys)
+            for episode in episodes:
+                index = int(episode["index"])
+                frames = int(episode.get("frames", 0) or 0)
+                if frames <= 0:
+                    problems.append(f"Episode {index} has zero frames.")
+                    continue
+
+                videos = {str(video.get("feature")): video for video in episode.get("videos", [])}
+                missing = sorted(expected_cameras - set(videos))
+                if missing:
+                    problems.append(f"Episode {index} is missing camera videos: {missing}.")
+
+                if fps <= 0:
+                    continue
+                expected_duration = frames / fps
+                tolerance = VIDEO_DURATION_TOLERANCE_FRAMES / fps
+                for feature, video in videos.items():
+                    duration = float(video["to_timestamp"]) - float(video["from_timestamp"])
+                    if abs(duration - expected_duration) <= tolerance:
+                        continue
+                    mismatch = {
+                        "episode_index": index,
+                        "camera": feature,
+                        "frames": frames,
+                        "expected_seconds": expected_duration,
+                        "video_seconds": duration,
+                    }
+                    video_mismatches.append(mismatch)
+                    problems.append(
+                        f"Episode {index} camera '{feature}' spans {duration:.3f}s, but "
+                        f"{frames} frames at {fps} FPS require {expected_duration:.3f}s."
+                    )
+
+        planned_rows: list[dict[str, Any]] = []
+        if sidecar.is_file():
+            for line_number, line in enumerate(sidecar.read_text().splitlines(), start=1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    row["dataset_episode_index"] = int(row["dataset_episode_index"])
+                    if not str(row["instruction"]).strip():
+                        raise ValueError("instruction is empty")
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                    problems.append(f"Episode plan line {line_number} is malformed: {error}.")
+                    continue
+                planned_rows.append(row)
+
+            planned_indices = [row["dataset_episode_index"] for row in planned_rows]
+            if planned_indices != list(range(total_episodes)):
+                problems.append(
+                    "Episode plan indices do not cover the dataset exactly: "
+                    f"expected 0..{max(total_episodes - 1, 0)}, found {planned_indices}."
+                )
+
+            actual_by_index = {int(item["index"]): str(item.get("task", "")) for item in episodes}
+            for row in planned_rows:
+                index = int(row["dataset_episode_index"])
+                expected_task = str(row["instruction"]).strip()
+                actual_task = actual_by_index.get(index)
+                if actual_task is None:
+                    problems.append(
+                        f"Episode {index} is planned as '{expected_task}', "
+                        "but has no readable metadata."
+                    )
+                elif actual_task != expected_task:
+                    task_mismatches.append(index)
+                    problems.append(
+                        f"Episode {index} task mismatch: plan is '{expected_task}', "
+                        f"embedded task is '{actual_task}'."
+                    )
+
+        return {
+            "checked_episode_metadata": bool(episode_files),
+            "checked_episode_plan": sidecar.is_file(),
+            "task_mismatches": task_mismatches,
+            "video_mismatches": video_mismatches,
+            "problems": problems,
+        }
 
     def _value_ranges(self, directory: Path) -> dict[str, float]:
         """How far each recorded signal actually travelled.
@@ -463,6 +664,7 @@ class DatasetStore:
                         "action_range": _range_of(row, "action"),
                         "state_range": _range_of(row, "observation.state"),
                         "still_joints": _still_joints_of(row, action_names),
+                        "videos": _episode_videos(row),
                         "_action_signature": _signature_of(row, "action"),
                         "_state_signature": _signature_of(row, "observation.state"),
                     }
@@ -516,6 +718,11 @@ class DatasetStore:
                 f"These recordings cannot be merged: {reasons} "
                 "Compare them first to see the values."
             )
+
+        for manifest, report in zip(manifests, reports, strict=True):
+            if report["integrity_status"] != STATUS_VERIFIED:
+                reasons = "; ".join(str(item) for item in report.get("problems", []))
+                raise DatasetError(f"Dataset '{manifest.name}' is not safe to merge: {reasons}")
 
         target_root = self.settings.lerobot_home / new_repo_id
         if target_root.exists():
@@ -672,6 +879,37 @@ def _first_task(tasks: Any) -> str:
         return str(next(iter(tasks), ""))
     except TypeError:
         return str(tasks)
+
+
+def _episode_videos(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve LeRobot v3 video segments without exposing filesystem paths."""
+    videos: list[dict[str, Any]] = []
+    suffix = "/chunk_index"
+    for key in sorted(row):
+        if not key.startswith("videos/observation.images.") or not key.endswith(suffix):
+            continue
+        feature = key[len("videos/") : -len(suffix)]
+        if re.fullmatch(r"observation\.images\.[A-Za-z0-9_-]+", feature) is None:
+            continue
+        prefix = f"videos/{feature}"
+        try:
+            chunk_index = int(row[key])
+            file_index = int(row[f"{prefix}/file_index"])
+            from_timestamp = float(row[f"{prefix}/from_timestamp"])
+            to_timestamp = float(row[f"{prefix}/to_timestamp"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        videos.append(
+            {
+                "camera": feature.rsplit(".", 1)[-1],
+                "feature": feature,
+                "chunk_index": chunk_index,
+                "file_index": file_index,
+                "from_timestamp": from_timestamp,
+                "to_timestamp": to_timestamp,
+            }
+        )
+    return videos
 
 
 def _mark_duplicates(episodes: list[dict[str, Any]]) -> None:

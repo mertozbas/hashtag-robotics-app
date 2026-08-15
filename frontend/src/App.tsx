@@ -57,6 +57,10 @@ import {
   type JobSnapshot,
   type PlannerStatus,
   type Policy,
+  type PlannedEpisode,
+  type RecordingGame,
+  type RecordingRoadmap,
+  type RecordingStatus,
   type Robot,
   type SafetyCheck,
   type SafetyStatus,
@@ -68,7 +72,10 @@ import {
   type Summary,
   type TargetMode,
   type Teleoperator,
+  type TelemetrySample,
   type TelemetrySummary,
+  type TicTacToeCatalogue,
+  type TicTacToeMove,
 } from "./api";
 
 /** Mirrors JOB_INPUT_KEYS in jobs.py; the server rejects anything else. */
@@ -105,6 +112,156 @@ const OPERATOR_KEYS: Record<string, Array<{ key: string; label: string }>> = {
 };
 
 const ACTIVE_STATES = ["queued", "starting", "running", "stopping"];
+const MANUAL_EPISODE_FAILSAFE_SECONDS = 600;
+const SIM_REHEARSAL_SECONDS = 60;
+const ROADMAP_STORAGE_KEY = "hashtag-recording-roadmap-v1";
+
+type RecordingCommandState = {
+  key: "end_episode" | "rerecord_episode" | "stop_recording";
+  state: "sending" | "acknowledged" | "failed";
+  message: string;
+};
+
+type RecordingUiPhase =
+  | "starting"
+  | "recording"
+  | "reset"
+  | "encoding"
+  | "saved"
+  | "stopping";
+
+type RecordingTransition = "encoding" | "stopping" | null;
+
+function recordingEventCopy(sample: TelemetrySample) {
+  const episode = sample.episode == null ? null : sample.episode + 1;
+  switch (sample.phase) {
+    case "recording":
+      return {
+        tone: "green",
+        title: `Episode ${episode ?? "—"} kaydı başladı`,
+        detail: "Kamera, state ve action frame'leri geçici take buffer'ına yazılıyor.",
+      };
+    case "control:end_episode":
+      return {
+        tone: "blue",
+        title: "SPACE komutu LeRobot tarafından alındı",
+        detail: "Bir sonraki lifecycle satırı reset veya video kodlama aşamasını gösterecek.",
+      };
+    case "reset":
+      return {
+        tone: "amber",
+        title: `Episode ${episode ?? "—"} çekimi kapandı · reset başladı`,
+        detail: "Reset hareketleri dataset'e yazılmaz. Sahne hazır olunca ikinci kez SPACE'e bas.",
+      };
+    case "encoding":
+      return {
+        tone: "blue",
+        title: `Episode ${episode ?? "—"} kodlanıyor`,
+        detail: "İki kamera videosu ve parquet verisi yazılıyor; bu sırada yeni komut gönderme.",
+      };
+    case "saved":
+      return {
+        tone: "green",
+        title: `Episode ${episode ?? "—"} diske kaydedildi`,
+        detail: "save_episode() tamamlandı; bu episode artık kalıcı.",
+      };
+    case "control:rerecord_episode":
+      return {
+        tone: "amber",
+        title: "Tekrar çek komutu LeRobot tarafından alındı",
+        detail: "Mevcut take silinecek; resetten sonra aynı görev yeniden başlayacak.",
+      };
+    case "rerecord":
+      return {
+        tone: "amber",
+        title: `Episode ${episode ?? "—"} tekrar çekilecek`,
+        detail: "Başarısız take kalıcı dataset'e eklenmedi.",
+      };
+    case "camera:incident_during_take":
+      return {
+        tone: "red",
+        title: "Kamera akışı durdu · mevcut take geçersiz",
+        detail:
+          "Recorder kamerayı yeniden açtı. Bu take otomatik kalite kapısına takıldı ve kaydedilmeyecek.",
+      };
+    case "camera:incident_during_reset":
+      return {
+        tone: "amber",
+        title: "Kamera reset sırasında yeniden açıldı",
+        detail: "Kapalı take etkilenmedi. Sahne hazırlığına devam etmeden iki görüntüyü kontrol et.",
+      };
+    case "camera:incident":
+      return {
+        tone: "amber",
+        title: "Kamera akışı yeniden açıldı",
+        detail: "Recorder kamerayı kurtardı; olayın gerçekleştiği kayıt fazı belirlenemedi.",
+      };
+    case "camera:take_invalidated":
+      return {
+        tone: "red",
+        title: `Episode ${episode ?? "—"} kamera olayı nedeniyle reddedildi`,
+        detail: "Sahneyi resetle; aynı görev temiz bir take olarak yeniden açılacak.",
+      };
+    case "manual:take":
+      return {
+        tone: "blue",
+        title: "Manuel take kapısı aktif",
+        detail: "Süre dolmaz; bu çekim yalnızca SPACE veya açık bir durdurma komutuyla kapanır.",
+      };
+    case "manual:reset":
+      return {
+        tone: "blue",
+        title: "Manuel reset kapısı aktif",
+        detail: "Süre dolmaz ve sıradaki episode kendiliğinden başlamaz; hazır olunca SPACE'e bas.",
+      };
+    case "control:stop_recording":
+      return {
+        tone: "amber",
+        title: "Kaydet ve bitir komutu LeRobot tarafından alındı",
+        detail: "Mevcut take kaydedilecek, ardından dataset finalize edilecek.",
+      };
+    case "stopping":
+      return {
+        tone: "amber",
+        title: "Kayıt oturumu sonlandırılıyor",
+        detail: "Dataset finalize ediliyor ve donanım bağlantıları güvenli biçimde kapatılıyor.",
+      };
+    default:
+      return {
+        tone: "neutral",
+        title: sample.message ?? sample.phase ?? "Recorder olayı",
+        detail: "LeRobot lifecycle bildirimi.",
+      };
+  }
+}
+
+function storedRoadmap(): RecordingRoadmap | null {
+  try {
+    const raw = window.localStorage.getItem(ROADMAP_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as RecordingRoadmap;
+    return Array.isArray(parsed.games) && parsed.games.length > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The SO-101 command/state vector has six actuator dimensions. Some product
+ * descriptions call the arm "5 DOF + gripper", but the dashboard is an
+ * operations surface: calibration, teleoperation and datasets all address the
+ * gripper as the sixth controllable axis. Keep that contract explicit here so
+ * a missing gripper row cannot make a six-axis arm look like a five-axis one.
+ */
+const SO101_DOF = 6;
+const SO101_JOINTS = [
+  "shoulder_pan",
+  "shoulder_lift",
+  "elbow_flex",
+  "wrist_flex",
+  "wrist_roll",
+  "gripper",
+] as const;
 
 /** Which page owns a job, so its approval card and live output appear once. */
 const JOB_PAGE: Record<string, View> = {
@@ -114,7 +271,8 @@ const JOB_PAGE: Record<string, View> = {
   recording: "collect",
   replay: "operate",
   evaluation: "operate",
-  policy_rollout: "operate",
+  policy_rollout: "policy",
+  policy_import: "policy",
   sim_teleoperation: "operate",
   // Recording is the whole point of the collection page, so its approval card
   // and its live output belong there rather than beside teleoperation.
@@ -175,6 +333,7 @@ const JOB_LABEL: Record<string, string> = {
   replay: "Replay",
   evaluation: "Evaluation",
   policy_rollout: "Policy rollout",
+  policy_import: "HF model import",
   sim_teleoperation: "Sim prova",
   sim_recording: "Sim kaydı",
   dataset_transform: "Veri seti düzenleme",
@@ -182,11 +341,12 @@ const JOB_LABEL: Record<string, string> = {
 };
 
 /**
- * Jobs worth opening the camera window for on their own. Teleoperation is here
- * because the dashboard can show it live; recording is here because the
- * operator still needs to see what the take is framed on, even frozen.
+ * Jobs worth opening the standalone camera window for on their own. Physical
+ * recording is deliberately absent: its Collect panel shows every mapped
+ * camera through the recorder-owned relay, so opening a frozen single-camera
+ * modal would hide the useful two-camera view.
  */
-const CAMERA_MODAL_JOB_KINDS = ["teleoperation", "recording", "evaluation", "policy_rollout"];
+const CAMERA_MODAL_JOB_KINDS = ["teleoperation", "evaluation", "policy_rollout"];
 
 const SETUP_JOB_KINDS = ["motor_setup", "calibration"];
 const OPERATE_JOB_KINDS = [
@@ -194,8 +354,8 @@ const OPERATE_JOB_KINDS = [
   "sim_teleoperation",
   "replay",
   "evaluation",
-  "policy_rollout",
 ];
+const POLICY_JOB_KINDS = ["policy_rollout"];
 
 function pendingApprovalFor(jobs: Job[], kinds: string[]): Job | undefined {
   return jobs.find((job) => job.state === "awaiting_confirmation" && kinds.includes(job.kind));
@@ -213,6 +373,7 @@ type View =
   | "collect"
   | "data"
   | "training"
+  | "policy"
   | "agents"
   | "activity"
   | "system";
@@ -248,6 +409,12 @@ const NAVIGATION: Array<{
   },
   { id: "data", label: "Veri Setleri", description: "Bölüm, karşılaştır, birleştir", icon: Database },
   { id: "training", label: "Eğitim", description: "Politika eğit ve değerlendir", icon: Cpu },
+  {
+    id: "policy",
+    label: "Model Çalıştır",
+    description: "HF modelini indir ve güvenli rollout yap",
+    icon: Play,
+  },
   { id: "agents", label: "Agents", description: "Strands gateway", icon: BrainCircuit, group: "ARAÇLAR" },
   { id: "activity", label: "Activity", description: "Job ve audit", icon: Activity },
   { id: "system", label: "System", description: "Doctor ve HIL", icon: TerminalSquare },
@@ -290,6 +457,11 @@ const PAGE_COPY: Record<View, { eyebrow: string; title: string; description: str
     eyebrow: "VERİ HATTI · 3/3",
     title: "Eğit ve değerlendir",
     description: "Yönettiğin veri setiyle politika eğit; çıkanı gerçek kolda değerlendir.",
+  },
+  policy: {
+    eyebrow: "POLICY · GUARDED ROLLOUT",
+    title: "Eğitilmiş modeli gerçek SO-101'de çalıştır",
+    description: "Pinned HF snapshot, kamera eşlemesi, preflight ve tek kullanımlık hareket onayı.",
   },
   agents: {
     eyebrow: "PHASE 3 · AGENT STUDIO",
@@ -447,15 +619,20 @@ function App() {
           ACTIVE_STATES.includes(job.state) &&
           job.target_mode === "real" &&
           CAMERA_MODAL_JOB_KINDS.includes(job.kind) &&
+          job.parameters.rollout_profile !== "tic_tac_toe_80k" &&
           Object.keys(job.resolved_targets?.camera_profile_ids ?? {}).length > 0,
       ) ?? null,
     [jobs],
   );
 
   useEffect(() => {
-    if (!cameraJob) return;
+    if (!cameraJob) {
+      setCameraModalId(null);
+      return;
+    }
     if (cameraModalDismissed === cameraJob.id) return;
-    const mapped = Object.values(cameraJob.resolved_targets?.camera_profile_ids ?? {})[0];
+    const mappedCameras = cameraJob.resolved_targets?.camera_profile_ids ?? {};
+    const mapped = mappedCameras.wrist ?? Object.values(mappedCameras)[0];
     if (mapped) setCameraModalId(mapped);
   }, [cameraJob, cameraModalDismissed]);
 
@@ -542,6 +719,31 @@ function App() {
     [runAction],
   );
 
+  const setPhysicalGate = useCallback(
+    (enabled: boolean) => {
+      if (
+        enabled &&
+        !window.confirm(
+          "Çalışma alanının boş olduğunu, leader/follower rollerini ve E-STOP erişimini " +
+            "kontrol ettim. Gerçek robot komutlarına izin verilsin mi?",
+        )
+      ) {
+        return Promise.resolve(null);
+      }
+      return runAction(
+        () =>
+          api.post<SafetyStatus>("/safety/physical-gate", {
+            enabled,
+            confirmed: enabled,
+          }),
+        enabled
+          ? "Fiziksel kapı bu dashboard oturumu için açıldı. Henüz hiçbir hareket başlatılmadı."
+          : "Fiziksel kapı kilitlendi.",
+      );
+    },
+    [runAction],
+  );
+
   const confirmJob = useCallback(
     (jobId: string, approvalId: string) =>
       runAction(
@@ -564,7 +766,7 @@ function App() {
     (jobId: string, key: string) =>
       runAction(
         () => api.post<Job>(`/jobs/${jobId}/input`, { key }),
-        `Operatör tuşu gönderildi: ${key}`,
+        `Komut recorder kanalına iletildi: ${key}. Uygulama onayı kayıt panelinde görünecek.`,
       ),
     [runAction],
   );
@@ -631,11 +833,45 @@ function App() {
     [runAction],
   );
 
+  const updateFollowerLimit = useCallback(
+    (maxRelativeTarget: number) =>
+      runAction(
+        () =>
+          api.post<SetupStatus>("/setup/follower-limit", {
+            max_relative_target: maxRelativeTarget,
+          }),
+        "Follower takip farkı limiti güncellendi.",
+      ),
+    [runAction],
+  );
+
   const releaseSlot = useCallback(
     (role: string) =>
       runAction(
         () => api.post<SetupStatus>("/setup/slots", { role, device_id: null }),
         "Yuva boşaltıldı.",
+      ),
+    [runAction],
+  );
+
+  const importCalibrations = useCallback(
+    (directory: string) =>
+      runAction(
+        () => api.post<CalibrationArtifact[]>("/calibrations/import", { directory }),
+        "Mevcut LeRobot kalibrasyonları içe aktarıldı.",
+      ),
+    [runAction],
+  );
+
+  const bindCalibration = useCallback(
+    (role: string, artifactId: string) =>
+      runAction(
+        () =>
+          api.post<SetupStatus>("/setup/calibrations/bind", {
+            role,
+            artifact_id: artifactId,
+          }),
+        "Mevcut kalibrasyon yuvaya bağlandı.",
       ),
     [runAction],
   );
@@ -806,7 +1042,7 @@ function App() {
           </div>
         )}
 
-        {!summary?.physical_enabled && (
+        {!summary?.physical_enabled ? (
           <div className="safety-banner">
             <ShieldCheck size={19} />
             <div>
@@ -816,8 +1052,22 @@ function App() {
                 kullanılabilir.
               </span>
             </div>
-            <button onClick={() => setView("system")}>
-              HIL kapısını gör <ChevronRight size={15} />
+            <button onClick={() => void setPhysicalGate(true)} disabled={busy || estopEngaged}>
+              Fiziksel kapıyı aç <ChevronRight size={15} />
+            </button>
+          </div>
+        ) : (
+          <div className="physical-banner">
+            <ShieldCheck size={19} />
+            <div>
+              <strong>Fiziksel kapı açık · HIL aktif</strong>
+              <span>
+                Gerçek robot workflow'ları çalışabilir. Bu durum hareket başlatmaz; her fiziksel iş
+                yine preflight ve operatör onayından geçer.
+              </span>
+            </div>
+            <button onClick={() => void setPhysicalGate(false)} disabled={busy}>
+              Kapıyı kilitle <LockKeyhole size={15} />
             </button>
           </div>
         )}
@@ -853,12 +1103,17 @@ function App() {
             <SetupWizard
               status={setup}
               devices={devices}
+              calibrations={calibrations}
               jobs={jobs}
               telemetry={telemetry}
+              safety={safety}
               onDiscover={discover}
               onIdentify={identifyDevice}
               onAssignSlot={assignSlot}
+              onUpdateFollowerLimit={updateFollowerLimit}
               onReleaseSlot={releaseSlot}
+              onImportCalibrations={importCalibrations}
+              onBindCalibration={bindCalibration}
               onCreateJob={createJob}
               onConfirm={confirmJob}
               onInput={sendJobInput}
@@ -914,6 +1169,21 @@ function App() {
               onAnnotate={annotateJob}
             />
           )}
+          {view === "policy" && (
+            <PolicyRunner
+              policies={policies}
+              robots={robots}
+              jobs={jobs}
+              telemetry={telemetry}
+              safety={safety}
+              onCreateJob={createJob}
+              onConfirm={confirmJob}
+              onInput={sendJobInput}
+              onCancel={cancelJob}
+              onEmergencyStop={emergencyStop}
+              onAnnotate={annotateJob}
+            />
+          )}
           {view === "agents" && (
             <AgentStudio agents={agents} onAction={runAction} />
           )}
@@ -922,6 +1192,7 @@ function App() {
               robots={robots}
               teleoperators={teleoperators}
               scenarios={scenarios}
+              datasets={datasets}
               jobs={jobs}
               telemetry={telemetry}
               safety={safety}
@@ -942,8 +1213,10 @@ function App() {
       {modalCamera && (
         <CameraLiveModal
           camera={modalCamera}
+          job={cameraJob}
           holder={cameraHolder}
           telemetry={cameraHolder ? telemetry[cameraHolder.id] : undefined}
+          onCancel={cancelJob}
           onClose={() => {
             setCameraModalId(null);
             setCameraModalDismissed(cameraJob?.id ?? null);
@@ -957,10 +1230,9 @@ function App() {
 /**
  * The camera view an operator needs while the arm is moving.
  *
- * One V4L2 node serves one program at a time, and this bench has exactly one
- * camera, so "live view during a recording" is not a feature that was left
- * unbuilt -- it is arithmetic. What the modal can do is be honest about which
- * of the two situations it is in:
+ * One camera node serves one program at a time, so "live view during a
+ * recording" cannot open the SO-101 camera beside LeRobot. What the modal can
+ * do is be honest about which of the two situations it is in:
  *
  * During teleoperation the dashboard owns the camera (the teleop command no
  * longer claims it, because it recorded nothing with it anyway), so the feed is
@@ -974,20 +1246,43 @@ function App() {
  */
 function CameraLiveModal({
   camera,
+  job,
   holder,
   telemetry,
+  onCancel,
   onClose,
 }: {
   camera: CameraProfile;
+  job: Job | null;
   holder: Job | null;
   telemetry: TelemetrySummary | undefined;
+  onCancel: (jobId: string) => Promise<unknown>;
   onClose: () => void;
 }) {
   const imageRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [frozen, setFrozen] = useState(false);
   const [failed, setFailed] = useState(false);
+  const [streamAttempt, setStreamAttempt] = useState(0);
+  const [stopRequested, setStopRequested] = useState(false);
   const held = holder !== null;
+  const teleoperation = job?.kind === "teleoperation" ? job : null;
+
+  useEffect(() => {
+    setFailed(false);
+    setStreamAttempt(0);
+  }, [camera.id]);
+
+  useEffect(() => setStopRequested(false), [job?.id]);
+
+  useEffect(() => {
+    if (!failed || held) return;
+    const timer = window.setTimeout(() => {
+      setFailed(false);
+      setStreamAttempt((current) => current + 1);
+    }, 1500);
+    return () => window.clearTimeout(timer);
+  }, [failed, held]);
 
   /**
    * Keep a recent still so there is something to show the instant the camera is
@@ -1052,7 +1347,7 @@ function CameraLiveModal({
             <img
               ref={imageRef}
               className="camera-modal-frame"
-              src={`/api/cameras/${camera.id}/preview.mjpg`}
+              src={`/api/cameras/${camera.id}/preview.mjpg?attempt=${streamAttempt}`}
               alt={`${camera.name} canlı görüntü`}
               onError={() => setFailed(true)}
               onLoad={() => setFailed(false)}
@@ -1069,6 +1364,32 @@ function CameraLiveModal({
             </div>
           )}
         </div>
+
+        {teleoperation && (
+          <div className="camera-modal-controls">
+            <div>
+              <strong>Teleop manuel durdurulana kadar devam eder.</strong>
+              <span>{teleoperation.message}</span>
+            </div>
+            <button
+              className="camera-stop-button"
+              disabled={stopRequested || teleoperation.state === "stopping"}
+              onClick={() => {
+                setStopRequested(true);
+                void onCancel(teleoperation.id).finally(() => setStopRequested(false));
+              }}
+            >
+              {stopRequested || teleoperation.state === "stopping" ? (
+                <LoaderCircle className="spin" size={16} />
+              ) : (
+                <Square size={15} />
+              )}
+              {stopRequested || teleoperation.state === "stopping"
+                ? "Sonlandırılıyor…"
+                : "Teleop'u sonlandır"}
+            </button>
+          </div>
+        )}
 
         {held && (
           <div className="camera-modal-note">
@@ -1252,12 +1573,17 @@ const STEP_WORD: Record<SetupStepState, string> = {
 function SetupWizard({
   status,
   devices,
+  calibrations,
   jobs,
   telemetry,
+  safety,
   onDiscover,
   onIdentify,
   onAssignSlot,
+  onUpdateFollowerLimit,
   onReleaseSlot,
+  onImportCalibrations,
+  onBindCalibration,
   onCreateJob,
   onConfirm,
   onInput,
@@ -1265,8 +1591,10 @@ function SetupWizard({
 }: {
   status: SetupStatus | null;
   devices: Device[];
+  calibrations: CalibrationArtifact[];
   jobs: Job[];
   telemetry: Record<string, TelemetrySummary>;
+  safety: SafetyStatus | null;
   onDiscover: () => Promise<unknown>;
   onIdentify: (deviceId: string) => Promise<DeviceIdentification | null>;
   onAssignSlot: (
@@ -1274,7 +1602,10 @@ function SetupWizard({
     deviceId: string,
     limit?: number,
   ) => Promise<SetupStatus | null>;
+  onUpdateFollowerLimit: (limit: number) => Promise<SetupStatus | null>;
   onReleaseSlot: (role: string) => Promise<SetupStatus | null>;
+  onImportCalibrations: (directory: string) => Promise<CalibrationArtifact[] | null>;
+  onBindCalibration: (role: string, artifactId: string) => Promise<SetupStatus | null>;
   onCreateJob: CreateJob;
   onConfirm: (jobId: string, approvalId: string) => Promise<unknown>;
   onInput: (jobId: string, key: string) => Promise<unknown>;
@@ -1282,8 +1613,12 @@ function SetupWizard({
 }) {
   const [identified, setIdentified] = useState<Record<string, DeviceIdentification>>({});
   const [picked, setPicked] = useState<Record<string, string>>({});
-  const [limit, setLimit] = useState(5);
+  const [limit, setLimit] = useState(10);
   const [workspace, setWorkspace] = useState<Record<string, boolean>>({});
+  const [calibrationDirectory, setCalibrationDirectory] = useState(
+    "~/.cache/huggingface/lerobot/calibration",
+  );
+  const [selectedCalibration, setSelectedCalibration] = useState<Record<string, string>>({});
 
   const serial = useMemo(
     () => devices.filter((item) => item.kind === "serial" && !item.is_simulated),
@@ -1296,6 +1631,17 @@ function SetupWizard({
   const lastCalibration = jobs.find(
     (job) => job.kind === "calibration" && job.state === "completed",
   );
+  const followerSlot = status?.slots.find((slot) => slot.role === "follower");
+
+  useEffect(() => {
+    setLimit(
+      followerSlot?.max_relative_target ?? safety?.default_max_relative_target ?? 10,
+    );
+  }, [
+    followerSlot?.profile_id,
+    followerSlot?.max_relative_target,
+    safety?.default_max_relative_target,
+  ]);
 
   const identify = async (deviceId: string) => {
     const result = await onIdentify(deviceId);
@@ -1326,6 +1672,20 @@ function SetupWizard({
   };
 
   const slotOf = (role: string) => status.slots.find((slot) => slot.role === role);
+
+  /** Keep the newest revision for each LeRobot id; restore backups stay available
+   *  through the API without turning the select into a list of duplicates. */
+  const calibrationsFor = (role: string) => {
+    const seen = new Set<string>();
+    return [...calibrations]
+      .filter((artifact) => artifact.role === role)
+      .sort((left, right) => right.created_at.localeCompare(left.created_at))
+      .filter((artifact) => {
+        if (seen.has(artifact.device_id)) return false;
+        seen.add(artifact.device_id);
+        return true;
+      });
+  };
 
   return (
     <section className="setup-layout">
@@ -1380,11 +1740,16 @@ function SetupWizard({
                   >
                     <div className="slot-head">
                       <strong>{slot.label}</strong>
-                      {slot.profile_id ? (
-                        <Tag tone="green">dolu</Tag>
-                      ) : (
-                        <Tag>boş</Tag>
-                      )}
+                      <div className="tag-row">
+                        <Tag tone={slot.motor_count === SO101_DOF ? "green" : "amber"}>
+                          {SO101_DOF} DOF · gripper dahil
+                        </Tag>
+                        {slot.profile_id ? (
+                          <Tag tone="green">dolu</Tag>
+                        ) : (
+                          <Tag>boş</Tag>
+                        )}
+                      </div>
                     </div>
 
                     {slot.profile_id ? (
@@ -1404,6 +1769,38 @@ function SetupWizard({
                           </div>
                         </div>
                         <span className="slot-port">{slot.port}</span>
+                        {slot.role === "follower" && (
+                          <div className="form-grid">
+                            <label>
+                              Follower hedef fark sınırı (°)
+                              <input
+                                type="number"
+                                min={1}
+                                max={safety?.max_relative_target_ceiling ?? 30}
+                                step={1}
+                                value={limit}
+                                onChange={(event) => setLimit(Number(event.target.value))}
+                              />
+                            </label>
+                            <span className="inline-note">
+                              Leader hedefi, follower'ın ölçülen konumundan en fazla bu kadar uzağa
+                              gönderilir. Bu kol için önerilen kontrollü değer 10°.
+                            </span>
+                            <button
+                              className="secondary-button"
+                              disabled={
+                                !Number.isFinite(limit) ||
+                                limit <= 0 ||
+                                limit > (safety?.max_relative_target_ceiling ?? 30) ||
+                                limit === slot.max_relative_target
+                              }
+                              onClick={() => void onUpdateFollowerLimit(limit)}
+                            >
+                              <Gauge size={15} />
+                              Limiti kaydet
+                            </button>
+                          </div>
+                        )}
                         <div className="button-cluster">
                           <button
                             className="table-action"
@@ -1496,15 +1893,20 @@ function SetupWizard({
                         {slot.role === "follower" && (
                           <div className="form-grid">
                             <label>
-                              Adım başına limit
+                              Follower hedef fark sınırı (°)
                               <input
                                 type="number"
                                 min={1}
-                                max={30}
+                                max={safety?.max_relative_target_ceiling ?? 30}
+                                step={1}
                                 value={limit}
                                 onChange={(event) => setLimit(Number(event.target.value))}
                               />
                             </label>
+                            <span className="inline-note">
+                              Leader hedefi ile follower'ın ölçülen konumu arasındaki izin verilen
+                              en büyük fark. Önerilen başlangıç: {safety?.default_max_relative_target ?? 10}°.
+                            </span>
                           </div>
                         )}
 
@@ -1545,6 +1947,28 @@ function SetupWizard({
           />
           <StepGuidance step={calibrateStep} />
 
+          <div className="calibration-import">
+            <label>
+              Mevcut LeRobot kalibrasyon klasörü
+              <input
+                value={calibrationDirectory}
+                onChange={(event) => setCalibrationDirectory(event.target.value)}
+                placeholder="~/.cache/huggingface/lerobot/calibration"
+              />
+            </label>
+            <button
+              className="secondary-button"
+              disabled={!calibrationDirectory.trim()}
+              onClick={() => void onImportCalibrations(calibrationDirectory.trim())}
+            >
+              <HardDrive size={16} />
+              Klasörden içe aktar
+            </button>
+            <span className="inline-note">
+              Yalnız SO-101 leader/follower JSON dosyaları okunur; robot hareket etmez.
+            </span>
+          </div>
+
           {calibrateStep?.state === "blocked" ? (
             <EmptyState icon={LockKeyhole} title="Önce iki yuvayı da doldur" />
           ) : (
@@ -1552,6 +1976,11 @@ function SetupWizard({
               {status.slots.map((slot) => {
                 const ready = Boolean(slot.profile_id && slot.connected);
                 const confirmed = workspace[slot.role] ?? false;
+                const availableCalibrations = calibrationsFor(slot.role);
+                const chosenCalibration = selectedCalibration[slot.role] ?? "";
+                const chosenArtifact = availableCalibrations.find(
+                  (artifact) => artifact.id === chosenCalibration,
+                );
                 const blockedReason = !status.physical_enabled
                   ? "Fiziksel adaptörler kapalı. Sunucuyu HASHTAG_ENABLE_PHYSICAL=true ile başlat."
                   : !ready
@@ -1563,11 +1992,16 @@ function SetupWizard({
                   <div className="slot-card" key={slot.role}>
                     <div className="slot-head">
                       <strong>{slot.label}</strong>
-                      {slot.calibration_revision ? (
-                        <Tag tone="green">kalibre</Tag>
-                      ) : (
-                        <Tag>kalibrasyon yok</Tag>
-                      )}
+                      <div className="tag-row">
+                        <Tag tone={slot.motor_count === SO101_DOF ? "green" : "amber"}>
+                          {slot.motor_count || "—"}/{SO101_DOF} eksen
+                        </Tag>
+                        {slot.calibration_revision ? (
+                          <Tag tone="green">kalibre</Tag>
+                        ) : (
+                          <Tag>kalibrasyon yok</Tag>
+                        )}
+                      </div>
                     </div>
                     <div className="slot-facts">
                       <div>
@@ -1589,6 +2023,52 @@ function SetupWizard({
                         {warning}
                       </span>
                     ))}
+                    <div className="existing-calibration">
+                      <label>
+                        Mevcut kalibrasyon
+                        <select
+                          value={chosenCalibration}
+                          onChange={(event) =>
+                            setSelectedCalibration((current) => ({
+                              ...current,
+                              [slot.role]: event.target.value,
+                            }))
+                          }
+                        >
+                          <option value="">Kalibrasyon seç</option>
+                          {availableCalibrations.map((artifact) => (
+                            <option
+                              key={artifact.id}
+                              value={artifact.id}
+                              disabled={!artifact.validation_result.valid}
+                            >
+                              {artifact.device_id} · {artifact.validation_result.motor_count ?? 0}
+                              /6 motor · {artifact.source}
+                              {!artifact.validation_result.valid ? " · geçersiz" : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <button
+                        className="secondary-button"
+                        disabled={!ready || !chosenArtifact?.validation_result.valid}
+                        onClick={() =>
+                          chosenArtifact &&
+                          void onBindCalibration(slot.role, chosenArtifact.id)
+                        }
+                      >
+                        <Check size={16} />
+                        Seçileni {slot.label.toLowerCase()} yuvasına bağla
+                      </button>
+                      {availableCalibrations.length === 0 && (
+                        <span className="inline-note">
+                          Bu rol için kayıt yok. Önce üstteki klasörden içe aktar.
+                        </span>
+                      )}
+                      <span className="inline-note">
+                        Dosya checksum ve rolü sunucuda doğrulanır; bu işlem hareket üretmez.
+                      </span>
+                    </div>
                     <label className="workspace-check">
                       <input
                         type="checkbox"
@@ -1822,7 +2302,16 @@ function Lab({
                     <h3>{robot.name}</h3>
                     <p>{robot.serial_number ?? "serial unresolved"}</p>
                   </div>
-                  <StatusBadge value={robot.target_mode} />
+                  <div className="tag-row">
+                    <Tag
+                      tone={
+                        Object.keys(robot.motor_layout).length === SO101_DOF ? "green" : "amber"
+                      }
+                    >
+                      {SO101_DOF} DOF · gripper dahil
+                    </Tag>
+                    <StatusBadge value={robot.target_mode} />
+                  </div>
                 </div>
                 <div className="verification-grid">
                   <Verification label="Calibration" value={robot.calibration_verified} />
@@ -1891,14 +2380,37 @@ function CameraStudio({
   onCreateJob: CreateJob;
 }) {
   const [previewId, setPreviewId] = useState<string | null>(null);
-  const [semantic, setSemantic] = useState("front");
+  const [semantic, setSemantic] = useState("wrist");
   const [resolution, setResolution] = useState(0);
   const [robotId, setRobotId] = useState("");
 
-  const connected = useMemo(
-    () => devices.filter((item) => item.kind === "camera" && !item.is_simulated),
-    [devices],
-  );
+  const connected = useMemo(() => {
+    const semanticByFingerprint = new Map(
+      cameras.map((camera) => [camera.device_fingerprint, camera.semantic_name]),
+    );
+    const hasSo101CameraSetup = cameras.some(
+      (camera) => camera.semantic_name === "wrist" || camera.semantic_name === "top",
+    );
+    const priority = (device: Device) => {
+      const semanticName = semanticByFingerprint.get(device.stable_fingerprint);
+      if (semanticName === "wrist" || device.name === "USB2.0_CAM1") return 0;
+      if (device.name.includes("MacBook")) return 2;
+      if (device.name.includes("iPhone")) return 3;
+      return 1;
+    };
+    return devices
+      .filter(
+        (item) =>
+          item.kind === "camera" &&
+          !item.is_simulated &&
+          item.health !== "absent" &&
+          (!hasSo101CameraSetup ||
+            item.name === "USB2.0_CAM1" ||
+            semanticByFingerprint.get(item.stable_fingerprint) === "wrist" ||
+            semanticByFingerprint.get(item.stable_fingerprint) === "top"),
+      )
+      .sort((left, right) => priority(left) - priority(right));
+  }, [cameras, devices]);
   const robot = robots.find((item) => item.id === robotId) ?? robots[0];
 
   useEffect(() => {
@@ -1921,19 +2433,23 @@ function CameraStudio({
       <Panel>
         <PanelHeader
           title="Kameralar"
-          subtitle="Kararlı /dev/v4l/by-id kimliği · index değil"
+          subtitle="SO-101 USB kamera öncelikli · düşük gecikmeli MJPEG"
           action={<button onClick={() => void onDiscoverCameras()}>Kameraları tara</button>}
         />
         {connected.length === 0 ? (
           <EmptyState
             icon={Camera}
             title="Bağlı kamera görünmüyor"
-            detail="USB kamerayı tak ve yeniden tara; /dev/v4l/by-id altındaki capture düğümü aranır."
+            detail="USB kamerayı tak ve yeniden tara; Linux'ta V4L2, macOS'ta AVFoundation aranır."
           />
         ) : (
           <div className="card-list">
             {connected.map((device) => {
               const profile = profileFor(device.stable_fingerprint);
+              // Two identical USB2.0_CAM1 devices can be wrist and top. The
+              // product name is not a role: only the profile the operator bound
+              // to this stable fingerprint may decide the semantic label.
+              const isWristCamera = profile?.semantic_name === "wrist";
               return (
                 <div className="camera-card" key={device.id}>
                   <div className="camera-card-head">
@@ -1942,10 +2458,14 @@ function CameraStudio({
                       <strong>{profile?.name ?? device.name}</strong>
                       <span>{device.stable_path ?? device.transient_path}</span>
                     </div>
-                    {profile ? (
-                      <Tag tone="green">{profile.semantic_name}</Tag>
+                    {isWristCamera ? (
+                      <Tag tone="green">SO-101 · wrist</Tag>
+                    ) : profile ? (
+                      <Tag tone={profile.semantic_name === "top" ? "blue" : "neutral"}>
+                        SO-101 · {profile.semantic_name}
+                      </Tag>
                     ) : (
-                      <Tag>profilsiz</Tag>
+                      <Tag>rol atanmamış</Tag>
                     )}
                   </div>
 
@@ -1964,7 +2484,7 @@ function CameraStudio({
                       {previewId === profile.id && (
                         <img
                           className="camera-stream"
-                          src={`/api/cameras/${profile.id}/preview.mjpg`}
+                          src={`/api/cameras/${profile.id}/preview.mjpg?device=${encodeURIComponent(device.serial_number ?? device.transient_path ?? "connected")}`}
                           alt={`${profile.name} canlı görüntü`}
                         />
                       )}
@@ -2269,7 +2789,7 @@ function ApprovalPanel({
           label="Limit profili"
           value={
             targets?.max_relative_target != null
-              ? `adım başına ${targets.max_relative_target}`
+              ? `mevcut konuma göre ±${targets.max_relative_target}°`
               : "limitsiz komut"
           }
           detail={targets?.action_shape?.length ? `action ${targets.action_shape[0]}` : undefined}
@@ -2345,11 +2865,37 @@ function LiveJobPanel({
   onCancel: (jobId: string) => Promise<unknown>;
   onEmergencyStop?: () => Promise<unknown>;
 }) {
+  const [tttBoardConfirmed, setTttBoardConfirmed] = useState(false);
+  const [liveAttempt, setLiveAttempt] = useState(0);
+  const [tttStartPending, setTttStartPending] = useState(false);
+  const [tttStopRequested, setTttStopRequested] = useState(false);
   const running = job.state === "running";
+  const ticTacToe = job.parameters.rollout_profile === "tic_tac_toe_80k";
   const keys = OPERATOR_KEYS[job.kind] ?? [];
   const expects = telemetry?.prompt?.expects ?? null;
   const ranges = Object.entries(telemetry?.ranges ?? {});
-  const joints = Object.entries(telemetry?.joints ?? {});
+  const reportedJoints = telemetry?.joints ?? {};
+  const hasJointTelemetry = Object.keys(reportedJoints).length > 0;
+  const joints = SO101_JOINTS.map(
+    (name) => [name, reportedJoints[name] ?? null] as const,
+  );
+  const tttEvents = telemetry?.events ?? [];
+  const tttPhase = [...tttEvents]
+    .reverse()
+    .find((event) => event.phase?.startsWith("ttt:"))?.phase;
+  const tttPreset = job.parameters.ttt_preset as
+    | { episode_index?: number; board_camera?: string; board_robot?: string }
+    | undefined;
+  const tttCameraRoles = Object.keys(job.resolved_targets?.camera_profile_ids ?? {}).sort(
+    (left, right) => (left === "top" ? -1 : right === "top" ? 1 : left.localeCompare(right)),
+  );
+
+  useEffect(() => {
+    setTttBoardConfirmed(false);
+    setLiveAttempt(0);
+    setTttStartPending(false);
+    setTttStopRequested(false);
+  }, [job.id]);
 
   return (
     <Panel className="live-panel">
@@ -2364,6 +2910,135 @@ function LiveJobPanel({
       <div className="live-progress">
         <span style={{ width: `${Math.round(job.progress * 100)}%` }} />
       </div>
+
+      {ticTacToe && (
+        <section className={`ttt-live-stage ${tttPhase?.replace(":", "-") ?? "starting"}`}>
+          <div className="ttt-live-status" role="status" aria-live="polite">
+            {tttPhase === "ttt:homing" || !tttPhase ? (
+              <LoaderCircle className="spin" size={22} />
+            ) : tttPhase === "ttt:home_ready" ? (
+              <CircleCheck size={22} />
+            ) : tttPhase === "ttt:homing_failed" ? (
+              <CircleAlert size={22} />
+            ) : (
+              <Radio size={22} />
+            )}
+            <div>
+              <span>{String(job.parameters.move_id ?? "Tic-Tac-Toe")}</span>
+              <strong>
+                {tttPhase === "ttt:home_ready"
+                  ? "Demo home hazır — tahtayı şimdi kur"
+                  : tttPhase === "ttt:inference"
+                    ? "Model çalışıyor ve rollout kaydediliyor"
+                    : tttPhase === "ttt:homing_failed"
+                      ? "Demo home doğrulanamadı"
+                      : "Robot eğitim başlangıç pozuna gidiyor"}
+              </strong>
+              <small>{String(job.parameters.task ?? "")}</small>
+            </div>
+          </div>
+
+          {tttPreset?.board_camera && (
+            <div className="ttt-live-board">
+              <div>
+                <span>TOP KAMERA BAŞLANGIÇ DÜZENİ</span>
+                <strong>Episode {tttPreset.episode_index}</strong>
+                <small>Kaynak parçayı pickup alanına koy; hedef hücreyi boş bırak.</small>
+              </div>
+              <TicTacToeBoard board={tttPreset.board_camera} />
+            </div>
+          )}
+
+          {tttCameraRoles.length > 0 && (
+            <div className="recording-camera-grid ttt-camera-grid">
+              {tttCameraRoles.map((role) => (
+                <figure className="recording-camera" key={role}>
+                  <img
+                    key={`${job.id}-${role}-${liveAttempt}`}
+                    src={`/api/recordings/${encodeURIComponent(job.id)}/cameras/${encodeURIComponent(role)}.mjpg?try=${liveAttempt}`}
+                    alt={`${role} rollout görüntüsü`}
+                    onError={() =>
+                      window.setTimeout(
+                        () => setLiveAttempt((attempt) => attempt + 1),
+                        1500,
+                      )
+                    }
+                  />
+                  <figcaption>
+                    <strong>{role}</strong>
+                    <span>dataset ile aynı canlı kare kaynağı</span>
+                  </figcaption>
+                </figure>
+              ))}
+            </div>
+          )}
+
+          {tttPhase === "ttt:home_ready" && (
+            <div className="ttt-start-gate">
+              <label className="workspace-check">
+                <input
+                  type="checkbox"
+                  checked={tttBoardConfirmed}
+                  onChange={(event) => setTttBoardConfirmed(event.target.checked)}
+                />
+                <span>
+                  <strong>Canlı top kameradaki tahta yukarıdaki düzenle aynı.</strong>
+                  <small>Kaynak parça görünür, hedef hücre boş ve hareket alanı temiz.</small>
+                </span>
+              </label>
+              <button
+                className="primary-button full-button"
+                disabled={!running || !tttBoardConfirmed || tttStartPending || tttStopRequested}
+                onClick={() => {
+                  setTttStartPending(true);
+                  void onInput(job.id, "end_episode").finally(() => setTttStartPending(false));
+                }}
+              >
+                {tttStartPending ? (
+                  <LoaderCircle className="spin" size={16} />
+                ) : (
+                  <Play size={16} />
+                )}
+                {tttStartPending ? "Model başlatılıyor…" : "Tahta hazır — modeli başlat"}
+              </button>
+            </div>
+          )}
+
+          {tttPhase === "ttt:inference" && (
+            <button
+              className="primary-button full-button"
+              disabled={!running || tttStopRequested}
+              onClick={() => {
+                setTttStopRequested(true);
+                void onInput(job.id, "stop_recording").catch(() => setTttStopRequested(false));
+              }}
+            >
+              {tttStopRequested ? (
+                <LoaderCircle className="spin" size={16} />
+              ) : (
+                <Square size={16} />
+              )}
+              {tttStopRequested
+                ? "Dataset kaydediliyor ve robot home'a dönüyor…"
+                : "Hamle tamamlandı — kaydet, home'a dön ve bitir"}
+            </button>
+          )}
+
+          {tttPhase !== "ttt:inference" && (
+            <button
+              className="secondary-button full-button"
+              disabled={!running || tttStopRequested}
+              onClick={() => {
+                setTttStopRequested(true);
+                void onInput(job.id, "stop_recording").catch(() => setTttStopRequested(false));
+              }}
+            >
+              <Square size={16} />
+              {tttStopRequested ? "Güvenli iptal uygulanıyor…" : "Rollout'u güvenli iptal et"}
+            </button>
+          )}
+        </section>
+      )}
 
       {telemetry?.prompt?.prompt && (
         <div className="operator-prompt">
@@ -2403,19 +3078,21 @@ function LiveJobPanel({
         </div>
       )}
 
-      {joints.length > 0 && (
+      {hasJointTelemetry && (
         <div className="joint-list">
           {joints.map(([name, value]) => (
-            <div className="joint-row" key={name}>
+            <div className={`joint-row ${value == null ? "missing" : ""}`} key={name}>
               <span>{name}</span>
               <span className="joint-track">
-                <i
-                  style={{
-                    left: `${Math.min(100, Math.max(0, (value + 100) / 2))}%`,
-                  }}
-                />
+                {value != null && (
+                  <i
+                    style={{
+                      left: `${Math.min(100, Math.max(0, (value + 100) / 2))}%`,
+                    }}
+                  />
+                )}
               </span>
-              <strong>{value.toFixed(1)}</strong>
+              <strong>{value == null ? "veri yok" : value.toFixed(1)}</strong>
             </div>
           ))}
         </div>
@@ -2440,23 +3117,36 @@ function LiveJobPanel({
         />
       </div>
 
+      {!ticTacToe && (
+        <div className="button-cluster">
+          {keys.map((entry) => (
+            <button
+              key={entry.key}
+              className={expects === entry.key ? "primary-button" : "secondary-button"}
+              disabled={!running}
+              onClick={() => void onInput(job.id, entry.key)}
+            >
+              {entry.label}
+            </button>
+          ))}
+        </div>
+      )}
       <div className="button-cluster">
-        {keys.map((entry) => (
+        {!ticTacToe && (
           <button
-            key={entry.key}
-            className={expects === entry.key ? "primary-button" : "secondary-button"}
-            disabled={!running}
-            onClick={() => void onInput(job.id, entry.key)}
+            className="secondary-button"
+            onClick={() =>
+              void (keys.some((entry) => entry.key === "stop_recording")
+                ? onInput(job.id, "stop_recording")
+                : onCancel(job.id))
+            }
           >
-            {entry.label}
+            <Square size={15} />
+            {keys.some((entry) => entry.key === "stop_recording")
+              ? "Kaydet ve durdur"
+              : "Güvenli durdur"}
           </button>
-        ))}
-      </div>
-      <div className="button-cluster">
-        <button className="secondary-button" onClick={() => void onCancel(job.id)}>
-          <Square size={15} />
-          Güvenli durdur
-        </button>
+        )}
         {onEmergencyStop && (
           <button className="estop large" onClick={() => void onEmergencyStop()}>
             <Octagon size={18} fill="currentColor" />
@@ -2500,8 +3190,7 @@ function Operate({
   const [robotId, setRobotId] = useState("");
   const [leaderId, setLeaderId] = useState("");
   const [task, setTask] = useState("Pick the object and place it in the target area");
-  const [fps, setFps] = useState(30);
-  const [teleopSeconds, setTeleopSeconds] = useState(20);
+  const [fps, setFps] = useState(60);
   const [workspaceConfirmed, setWorkspaceConfirmed] = useState(false);
 
   const real = mode === "real";
@@ -2540,15 +3229,15 @@ function Operate({
   }, [leaders, leaderId]);
   useEffect(() => setWorkspaceConfirmed(false), [mode, robotId]);
 
-  const parameters = useMemo(() => {
+  const parameters = useMemo<Record<string, unknown>>(() => {
     const base: Record<string, unknown> = {
       robot_profile_id: robotId,
       teleoperator_profile_id: leaderId,
       fps,
     };
     if (real) base.workspace_confirmed = workspaceConfirmed;
-    return { ...base, teleop_time_s: teleopSeconds };
-  }, [robotId, leaderId, fps, real, workspaceConfirmed, teleopSeconds]);
+    return base;
+  }, [robotId, leaderId, fps, real, workspaceConfirmed]);
 
   const preview = usePreview(
     real && robotId
@@ -2625,16 +3314,10 @@ function Operate({
               onChange={(event) => setFps(Number(event.target.value))}
             />
           </label>
-          <label>
-            Teleop süresi (sn)
-            <input
-              type="number"
-              min={1}
-              max={600}
-              value={teleopSeconds}
-              onChange={(event) => setTeleopSeconds(Number(event.target.value))}
-            />
-          </label>
+          <div className="teleop-session-note">
+            <strong>Manuel oturum</strong>
+            <span>Kamera penceresindeki sonlandırma düğmesine basana kadar devam eder.</span>
+          </div>
         </div>
 
         {real ? (
@@ -2726,6 +3409,55 @@ function Operate({
         </Panel>
       )}
     </section>
+  );
+}
+
+function EpisodeVideo({
+  datasetId,
+  episode,
+  video,
+}: {
+  datasetId: string;
+  episode: number;
+  video: DatasetEpisode["videos"][number];
+}) {
+  const ref = useRef<HTMLVideoElement | null>(null);
+  const start = video.from_timestamp;
+  const end = video.to_timestamp;
+  const source =
+    `/api/datasets/${encodeURIComponent(datasetId)}/episodes/${episode}` +
+    `/videos/${encodeURIComponent(video.camera)}.mp4#t=${start},${end}`;
+
+  const seekToStart = () => {
+    const player = ref.current;
+    if (player && Number.isFinite(start)) player.currentTime = start;
+  };
+
+  return (
+    <figure className="episode-video">
+      <video
+        ref={ref}
+        controls
+        playsInline
+        preload="metadata"
+        src={source}
+        onLoadedMetadata={seekToStart}
+        onPlay={() => {
+          const player = ref.current;
+          if (player && (player.currentTime < start || player.currentTime >= end)) seekToStart();
+        }}
+        onTimeUpdate={() => {
+          const player = ref.current;
+          if (!player || player.currentTime < end) return;
+          player.pause();
+          player.currentTime = start;
+        }}
+      />
+      <figcaption>
+        <strong>{video.camera}</strong>
+        <span>{Math.max(0, end - start).toFixed(1)} sn</span>
+      </figcaption>
+    </figure>
   );
 }
 
@@ -3193,43 +3925,57 @@ function DataStudio({
                           )}
                           <div className="episode-list">
                             {episodes.episodes.map((episode: DatasetEpisode) => (
-                              <label className="episode-row" key={episode.index}>
-                                <input
-                                  type="checkbox"
-                                  checked={dropping.includes(episode.index)}
-                                  onChange={() =>
-                                    setDropping((current) =>
-                                      current.includes(episode.index)
-                                        ? current.filter((item) => item !== episode.index)
-                                        : [...current, episode.index],
-                                    )
-                                  }
-                                />
-                                <strong>#{episode.index}</strong>
-                                <span>{episode.frames} kare</span>
-                                <span className="mono-copy">
-                                  {episode.action_range != null
-                                    ? `aksiyon ${episode.action_range.toFixed(2)}`
-                                    : "aksiyon ?"}
-                                </span>
-                                {episode.demonstrates_nothing && (
-                                  <Tag tone="blue">hiçbir şey gösterilmemiş</Tag>
-                                )}
-                                {episode.duplicate_of != null && (
-                                  <Tag tone="amber">
-                                    #{episode.duplicate_of} ile aynı kayıt
-                                  </Tag>
-                                )}
-                                {!episode.demonstrates_nothing &&
-                                  (episode.still_joints?.length ?? 0) > 0 && (
+                              <div className="episode-inspector" key={episode.index}>
+                                <label className="episode-row">
+                                  <input
+                                    type="checkbox"
+                                    checked={dropping.includes(episode.index)}
+                                    onChange={() =>
+                                      setDropping((current) =>
+                                        current.includes(episode.index)
+                                          ? current.filter((item) => item !== episode.index)
+                                          : [...current, episode.index],
+                                      )
+                                    }
+                                  />
+                                  <strong>#{episode.index}</strong>
+                                  <span>{episode.frames} kare</span>
+                                  <span className="mono-copy">
+                                    {episode.action_range != null
+                                      ? `aksiyon ${episode.action_range.toFixed(2)}`
+                                      : "aksiyon ?"}
+                                  </span>
+                                  {episode.demonstrates_nothing && (
+                                    <Tag tone="blue">hiçbir şey gösterilmemiş</Tag>
+                                  )}
+                                  {episode.duplicate_of != null && (
                                     <Tag tone="amber">
-                                      {episode.still_joints!.map((name) =>
-                                        name.replace(".pos", ""),
-                                      ).join(", ")}{" "}
-                                      hiç oynamadı
+                                      #{episode.duplicate_of} ile aynı kayıt
                                     </Tag>
                                   )}
-                              </label>
+                                  {!episode.demonstrates_nothing &&
+                                    (episode.still_joints?.length ?? 0) > 0 && (
+                                      <Tag tone="amber">
+                                        {episode.still_joints!.map((name) =>
+                                          name.replace(".pos", ""),
+                                        ).join(", ")}{" "}
+                                        hiç oynamadı
+                                      </Tag>
+                                    )}
+                                </label>
+                                {(episode.videos?.length ?? 0) > 0 && (
+                                  <div className="episode-video-grid">
+                                    {(episode.videos ?? []).map((video) => (
+                                      <EpisodeVideo
+                                        key={video.feature}
+                                        datasetId={dataset.id}
+                                        episode={episode.index}
+                                        video={video}
+                                      />
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
                             ))}
                           </div>
                           <div className="button-cluster">
@@ -3520,6 +4266,440 @@ function TrainingStudio({
           </div>
         )}
       </Panel>
+    </>
+  );
+}
+
+function TicTacToeBoard({ board }: { board: string }) {
+  return (
+    <div className="ttt-board" aria-label={`Tahta ${board}`}>
+      {board.replaceAll("/", "").split("").map((cell, index) => (
+        <span className={`ttt-cell piece-${cell === "." ? "empty" : cell}`} key={index}>
+          {cell === "." ? "" : cell}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function TicTacToeMoveCard({ move }: { move: TicTacToeMove }) {
+  return (
+    <section className="ttt-move-card">
+      <div>
+        <span>EĞİTİM REFERANSI · EPISODE {move.episode_index}</span>
+        <strong>{move.id} · {move.task}</strong>
+        <small>
+          {move.object_name} kaynak alanda görünür, hedef hücre boş olmalı. Aşağıdaki düzen
+          top kameranın gördüğü yöndür. Masa ve tahta yüksekliği başarılı bench kurulumu ile aynı
+          olmalı; policy ayrı bir Cartesian masa mesafesi koruması kullanmıyor.
+        </small>
+      </div>
+      <TicTacToeBoard board={move.board_camera} />
+    </section>
+  );
+}
+
+function PolicyRunner({
+  policies,
+  robots,
+  jobs,
+  telemetry,
+  safety,
+  onCreateJob,
+  onConfirm,
+  onInput,
+  onCancel,
+  onEmergencyStop,
+  onAnnotate,
+}: {
+  policies: Policy[];
+  robots: Robot[];
+  jobs: Job[];
+  telemetry: Record<string, TelemetrySummary>;
+  safety: SafetyStatus | null;
+  onCreateJob: CreateJob;
+  onConfirm: (jobId: string, approvalId: string) => Promise<unknown>;
+  onInput: (jobId: string, key: string) => Promise<unknown>;
+  onCancel: (jobId: string) => Promise<unknown>;
+  onEmergencyStop: () => Promise<unknown>;
+  onAnnotate: (
+    jobId: string,
+    episode: number,
+    outcome: "success" | "failure",
+  ) => Promise<Job | null>;
+}) {
+  const [rolloutProfile, setRolloutProfile] = useState<"tic_tac_toe" | "generic">(
+    "tic_tac_toe",
+  );
+  const [ticTacToe, setTicTacToe] = useState<TicTacToeCatalogue | null>(null);
+  const [moveId, setMoveId] = useState("X-7");
+  const [repoId, setRepoId] = useState(
+    "HashtagRobotics/smolvla-tic-tac-toe-games-1-5-80k",
+  );
+  const [revision, setRevision] = useState("");
+  const [modelName, setModelName] = useState("Tic-Tac-Toe SmolVLA · Games 1–5 · 80K");
+  const [topRole, setTopRole] = useState("top");
+  const [wristRole, setWristRole] = useState("wrist");
+  const [policyId, setPolicyId] = useState("");
+  const [robotId, setRobotId] = useState("");
+  const [task, setTask] = useState("put the red cube in the middle right cell");
+  const [duration, setDuration] = useState(20);
+  const [fps, setFps] = useState(30);
+  const [device, setDevice] = useState("mps");
+  const [workspaceConfirmed, setWorkspaceConfirmed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .get<TicTacToeCatalogue>("/policy-rollouts/tic-tac-toe")
+      .then((catalogue) => {
+        if (!cancelled) setTicTacToe(catalogue);
+      })
+      .catch(() => {
+        if (!cancelled) setTicTacToe(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const runnablePolicies = useMemo(
+    () => policies.filter((policy) => Boolean(policy.checkpoint)),
+    [policies],
+  );
+  const followers = useMemo(
+    () => robots.filter((robot) => robot.target_mode === "real"),
+    [robots],
+  );
+
+  useEffect(() => {
+    if (!runnablePolicies.some((policy) => policy.id === policyId)) {
+      const preferred = runnablePolicies.find(
+        (policy) => policy.model_repo_id === repoId,
+      );
+      setPolicyId(preferred?.id ?? runnablePolicies[0]?.id ?? "");
+    }
+  }, [policyId, repoId, runnablePolicies]);
+  useEffect(() => {
+    if (!followers.some((robot) => robot.id === robotId)) {
+      setRobotId(followers[0]?.id ?? "");
+    }
+  }, [followers, robotId]);
+  useEffect(
+    () => setWorkspaceConfirmed(false),
+    [moveId, policyId, robotId, rolloutProfile],
+  );
+
+  const policy = runnablePolicies.find((item) => item.id === policyId) ?? null;
+  const selectedMove = ticTacToe?.moves.find((move) => move.id === moveId) ?? null;
+  const physicalLocked = !(safety?.physical_enabled ?? false);
+  const parameters = useMemo<Record<string, unknown>>(
+    () =>
+      rolloutProfile === "tic_tac_toe"
+        ? {
+            policy_id: policyId,
+            robot_profile_id: robotId,
+            rollout_profile: ticTacToe?.profile ?? "tic_tac_toe_80k",
+            move_id: moveId,
+            device,
+            workspace_confirmed: workspaceConfirmed,
+          }
+        : {
+            policy_id: policyId,
+            robot_profile_id: robotId,
+            task: task.trim(),
+            strategy: "base",
+            duration,
+            fps,
+            device,
+            display_data: false,
+            workspace_confirmed: workspaceConfirmed,
+          },
+    [
+      device,
+      duration,
+      fps,
+      moveId,
+      policyId,
+      robotId,
+      rolloutProfile,
+      task,
+      ticTacToe?.profile,
+      workspaceConfirmed,
+    ],
+  );
+  const preview = usePreview(
+    policyId && robotId
+      ? {
+          kind: "policy_rollout",
+          target_mode: "real",
+          parameters,
+          resources: [],
+          requested_by: "dashboard",
+        }
+      : null,
+  );
+  const blockedByPreflight = Boolean(preview && !preview.preflight.allowed);
+  const pendingApproval = pendingApprovalFor(jobs, POLICY_JOB_KINDS);
+  const activeJob = activeJobFor(jobs, POLICY_JOB_KINDS);
+  const importJob = jobs.find((job) => job.kind === "policy_import");
+  const importRunning = Boolean(
+    importJob && ["queued", "starting", "running", "stopping"].includes(importJob.state),
+  );
+  const rolloutSelectionReady =
+    rolloutProfile === "tic_tac_toe" ? Boolean(selectedMove) : Boolean(task.trim());
+
+  return (
+    <>
+      <section className="two-column training-grid">
+        <Panel>
+          <PanelHeader
+            title="HF modelini içe aktar"
+            subtitle="Token uygulamaya yazılmaz; mevcut hf auth oturumu kullanılır"
+          />
+          <div className="form-grid">
+            <label className="form-span">
+              Model repo
+              <input value={repoId} onChange={(event) => setRepoId(event.target.value)} />
+            </label>
+            <label>
+              Revision
+              <input
+                value={revision}
+                onChange={(event) => setRevision(event.target.value)}
+                placeholder="boşsa repo HEAD; indirirken SHA'ya pinlenir"
+              />
+            </label>
+            <label>
+              Registry adı
+              <input value={modelName} onChange={(event) => setModelName(event.target.value)} />
+            </label>
+            <label>
+              Üst kamera rolü
+              <input value={topRole} onChange={(event) => setTopRole(event.target.value)} />
+              <small>→ observation.images.camera1</small>
+            </label>
+            <label>
+              Bilek kamera rolü
+              <input value={wristRole} onChange={(event) => setWristRole(event.target.value)} />
+              <small>→ observation.images.camera2</small>
+            </label>
+          </div>
+          <button
+            className="primary-button full-button"
+            disabled={!repoId.includes("/") || importRunning || !topRole || !wristRole}
+            onClick={() =>
+              void onCreateJob("policy_import", "read_only", {
+                repo_id: repoId.trim(),
+                revision: revision.trim(),
+                name: modelName.trim(),
+                camera_mapping: {
+                  [`observation.images.${topRole.trim()}`]: "observation.images.camera1",
+                  [`observation.images.${wristRole.trim()}`]: "observation.images.camera2",
+                },
+              })
+            }
+          >
+            {importRunning ? <LoaderCircle className="spin" size={17} /> : <HardDrive size={17} />}
+            {importRunning ? "Model indiriliyor" : "HF'den indir ve registry'ye ekle"}
+          </button>
+          {importJob && (
+            <div className="scenario-note">
+              <StatusBadge value={importJob.state} /> {importJob.message}
+              {typeof importJob.result.revision === "string" && (
+                <span className="mono-copy"> · {importJob.result.revision.slice(0, 12)}</span>
+              )}
+              {typeof importJob.result.artifact_error === "string" && (
+                <span> · {importJob.result.artifact_error}</span>
+              )}
+            </div>
+          )}
+        </Panel>
+
+        <Panel>
+          <PanelHeader title="Yerel policy" subtitle={`${runnablePolicies.length} çalıştırılabilir model`} />
+          <div className="form-grid">
+            <label className="form-span">
+              Policy
+              <select value={policyId} onChange={(event) => setPolicyId(event.target.value)}>
+                <option value="">Policy seç</option>
+                {runnablePolicies.map((item) => (
+                  <option value={item.id} key={item.id}>
+                    {item.name} · {item.policy_type}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          {!policy ? (
+            <EmptyState icon={Cpu} title="Önce modeli HF'den içe aktar" />
+          ) : (
+            <div className="schema-preview">
+              <span>PINNED POLICY</span>
+              <code>{policy.model_repo_id ?? policy.name}</code>
+              <code>{policy.model_revision ?? "yerel checkpoint"}</code>
+              <code>action {JSON.stringify(policy.action_shape)}</code>
+              <code>{policy.empty_cameras} empty camera</code>
+              {Object.entries(policy.camera_mapping).map(([source, target]) => (
+                <code key={source}>{source} → {target}</code>
+              ))}
+            </div>
+          )}
+        </Panel>
+      </section>
+
+      <section className="two-column training-grid">
+        <Panel>
+          <PanelHeader
+            title="Guarded rollout"
+            subtitle={
+              rolloutProfile === "tic_tac_toe"
+                ? "Eğitim presetli · kayıt açık · q ile güvenli bitiş"
+                : "Süreli generic policy kontrolü"
+            }
+          />
+          <div className="form-grid">
+            <label className="form-span">
+              Rollout profili
+              <select
+                value={rolloutProfile}
+                onChange={(event) =>
+                  setRolloutProfile(event.target.value as "tic_tac_toe" | "generic")
+                }
+              >
+                <option value="tic_tac_toe">Tic-Tac-Toe 80K · 18 kontrollü hamle</option>
+                <option value="generic">Generic · süreli exact task</option>
+              </select>
+            </label>
+            <label>
+              Follower profili
+              <select value={robotId} onChange={(event) => setRobotId(event.target.value)}>
+                <option value="">Gerçek follower seç</option>
+                {followers.map((robot) => (
+                  <option value={robot.id} key={robot.id}>{robot.name}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Inference device
+              <select value={device} onChange={(event) => setDevice(event.target.value)}>
+                <option value="mps">Apple MPS</option>
+                <option value="cuda">CUDA</option>
+                <option value="cpu">CPU</option>
+              </select>
+            </label>
+            {rolloutProfile === "tic_tac_toe" ? (
+              <label className="form-span">
+                Test hamlesi
+                <select value={moveId} onChange={(event) => setMoveId(event.target.value)}>
+                  {(ticTacToe?.moves ?? []).map((move) => (
+                    <option key={move.id} value={move.id}>
+                      {move.id} · {move.object_name} → {move.cell}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : (
+              <>
+                <label className="form-span">
+                  Exact task
+                  <input value={task} onChange={(event) => setTask(event.target.value)} />
+                </label>
+                <label>
+                  Süre (s)
+                  <input
+                    type="number"
+                    min={5}
+                    max={60}
+                    value={duration}
+                    onChange={(event) => setDuration(Number(event.target.value))}
+                  />
+                </label>
+                <label>
+                  Control FPS
+                  <input
+                    type="number"
+                    min={5}
+                    max={60}
+                    value={fps}
+                    onChange={(event) => setFps(Number(event.target.value))}
+                  />
+                </label>
+              </>
+            )}
+          </div>
+          {rolloutProfile === "tic_tac_toe" && selectedMove && (
+            <TicTacToeMoveCard move={selectedMove} />
+          )}
+          <label className="workspace-check">
+            <input
+              type="checkbox"
+              checked={workspaceConfirmed}
+              onChange={(event) => setWorkspaceConfirmed(event.target.checked)}
+            />
+            <span>
+              <strong>
+                {rolloutProfile === "tic_tac_toe"
+                  ? "Homing süpürme alanı boş ve güç kesme erişilebilir."
+                  : "Tahta, parçalar ve kol başlangıç pozu hazır; çalışma alanı temiz."}
+              </strong>
+              <small>
+                {rolloutProfile === "tic_tac_toe"
+                  ? "Tahtayı robot demo home'a ulaştıktan sonra canlı kameraya bakarak kuracaksın."
+                  : "Bu beyan approval öncesi ve sonrasında tekrar doğrulanır."}
+              </small>
+            </span>
+          </label>
+          <CommandPreviewBlock preview={preview} />
+          {preview && <PreflightChecklist checks={preview.preflight.checks} />}
+          <button
+            className="primary-button full-button"
+            disabled={
+              !policyId ||
+              !robotId ||
+              !rolloutSelectionReady ||
+              physicalLocked ||
+              !workspaceConfirmed ||
+              blockedByPreflight
+            }
+            onClick={() => void onCreateJob("policy_rollout", "real", parameters)}
+          >
+            <Play size={17} />
+            {rolloutProfile === "tic_tac_toe"
+              ? `${moveId} rollout'unu onaya gönder`
+              : `${duration} saniyelik güvenli rollout'u onaya gönder`}
+          </button>
+          {physicalLocked && (
+            <span className="inline-note">
+              <LockKeyhole size={14} /> Fiziksel kapı kilitli; System üzerinden HIL oturumunda aç.
+            </span>
+          )}
+          <p className="scenario-note">
+            {rolloutProfile === "tic_tac_toe"
+              ? "Backend görev metnini, episode presetini, demo home pozunu, 30 FPS async full-chunk inference'ı ve kayıt klasörünü sabitler; browser bu alanları değiştiremez."
+              : "LeRobot checkpoint'i ve processor'ları robota bağlanmadan önce yükler. Model veya device uyumsuzsa fiziksel bağlantı açılmadan süreç hata verir."}
+          </p>
+        </Panel>
+
+        {pendingApproval ? (
+          <ApprovalPanel job={pendingApproval} onConfirm={onConfirm} onCancel={onCancel} />
+        ) : activeJob ? (
+          <LiveJobPanel
+            job={activeJob}
+            telemetry={telemetry[activeJob.id]}
+            onInput={onInput}
+            onCancel={onCancel}
+            onEmergencyStop={onEmergencyStop}
+          />
+        ) : (
+          <Panel>
+            <PanelHeader title="Rollout durumu" subtitle="Model yükleme → kamera → robot → inference" />
+            <EmptyState icon={Play} title="Aktif rollout yok" />
+          </Panel>
+        )}
+      </section>
+
+      <EvaluationAnnotations jobs={jobs} onAnnotate={onAnnotate} />
     </>
   );
 }
@@ -4064,10 +5244,34 @@ function AgentStudio({
  * or a model -- is the only thing that changes, and the server picks the
  * recorder from `target_mode`.
  */
+function GamePlanQueue({ game }: { game: RecordingGame }) {
+  return (
+    <div className="game-plan-queue">
+      <div className="game-plan-summary">
+        <strong>Oyun {game.game}</strong>
+        <span>{game.reset_instruction}</span>
+      </div>
+      {game.episodes.map((episode) => (
+        <div className="game-plan-row" key={episode.global_episode}>
+          <span className="plan-episode-id">
+            #{String(episode.global_episode).padStart(3, "0")}
+          </span>
+          <code>{episode.board_before}</code>
+          <span>{episode.instruction}</span>
+          <Tag tone={episode.after === "undo" ? "amber" : "green"}>
+            {episode.after === "undo" ? "geri al" : "bırak"}
+          </Tag>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function CollectStudio({
   robots,
   teleoperators,
   scenarios,
+  datasets,
   jobs,
   telemetry,
   safety,
@@ -4079,6 +5283,7 @@ function CollectStudio({
   robots: Robot[];
   teleoperators: Teleoperator[];
   scenarios: Scenario[];
+  datasets: Dataset[];
   jobs: Job[];
   telemetry: Record<string, TelemetrySummary>;
   safety: SafetyStatus | null;
@@ -4090,16 +5295,27 @@ function CollectStudio({
   const [mode, setMode] = useState<TargetMode>("sim");
   const [robotId, setRobotId] = useState("");
   const [leaderId, setLeaderId] = useState("");
-  const [repoId, setRepoId] = useState("mertkirgil/so101_yeni_kayit");
+  const [repoId, setRepoId] = useState("hashtagrobotics/tic-tac-toe-so101");
   const [task, setTask] = useState("pick up the red cube and drop it in the bin");
   const [episodes, setEpisodes] = useState(5);
-  const [episodeSeconds, setEpisodeSeconds] = useState(30);
+  const [roadmap, setRoadmap] = useState<RecordingRoadmap | null>(storedRoadmap);
+  const [selectedGameNumber, setSelectedGameNumber] = useState(
+    () => storedRoadmap()?.games[0]?.game ?? 1,
+  );
+  const [destinationDatasetId, setDestinationDatasetId] = useState("new");
+  const [roadmapError, setRoadmapError] = useState<string | null>(null);
   const [workspaceConfirmed, setWorkspaceConfirmed] = useState(false);
   const [scenarioId, setScenarioId] = useState("");
   const [openViewer, setOpenViewer] = useState(true);
   const [keepOnlySuccesses, setKeepOnlySuccesses] = useState(false);
   const [backends, setBackends] = useState<SimulationBackends | null>(null);
   const [liveAttempt, setLiveAttempt] = useState(0);
+  const [recordingStatus, setRecordingStatus] = useState<RecordingStatus | null>(null);
+  const [recordingCommand, setRecordingCommand] = useState<RecordingCommandState | null>(
+    null,
+  );
+  const [recordingTransition, setRecordingTransition] =
+    useState<RecordingTransition>(null);
   /**
    * Reconnect the live picture when the recorder moves to the next episode.
    *
@@ -4120,6 +5336,46 @@ function CollectStudio({
 
   const real = mode === "real";
   const physicalLocked = !(safety?.physical_enabled ?? false);
+  const selectedGame =
+    roadmap?.games.find((game) => game.game === selectedGameNumber) ?? null;
+  const destinationDataset =
+    destinationDatasetId === "new"
+      ? null
+      : datasets.find((dataset) => dataset.id === destinationDatasetId) ?? null;
+  const expectedGlobalEpisode = destinationDataset ? destinationDataset.episodes + 1 : 1;
+  const selectedGameStart = selectedGame?.episodes[0]?.global_episode ?? null;
+  const remainingPlannedEpisodes = selectedGame
+    ? destinationDataset
+      ? selectedGame.episodes.filter(
+          (episode) => episode.global_episode >= expectedGlobalEpisode,
+        )
+      : selectedGame.episodes
+    : [];
+  const selectedQueueStart = remainingPlannedEpisodes[0]?.global_episode ?? null;
+  const selectedGameEnd = selectedGame?.episodes.at(-1)?.global_episode ?? null;
+  const selectedGameComplete = Boolean(
+    destinationDataset &&
+      selectedGameEnd !== null &&
+      expectedGlobalEpisode > selectedGameEnd,
+  );
+  const planOrderMatches =
+    selectedGame === null || selectedGameComplete || selectedQueueStart === expectedGlobalEpisode;
+
+  const importRoadmap = async (file: File | undefined) => {
+    if (!file) return;
+    setRoadmapError(null);
+    try {
+      const parsed = await api.post<RecordingRoadmap>("/recording-plans/parse", {
+        source_name: file.name,
+        content: await file.text(),
+      });
+      setRoadmap(parsed);
+      setSelectedGameNumber(parsed.games[0].game);
+      window.localStorage.setItem(ROADMAP_STORAGE_KEY, JSON.stringify(parsed));
+    } catch (error) {
+      setRoadmapError(error instanceof Error ? error.message : String(error));
+    }
+  };
 
   useEffect(() => {
     void api
@@ -4165,14 +5421,47 @@ function CollectStudio({
 
   const scenario = scenarios.find((item) => item.id === scenarioId) ?? null;
 
-  const parameters = useMemo(() => {
+  const parameters = useMemo<Record<string, unknown>>(() => {
+    const plannedEpisodes = remainingPlannedEpisodes;
+    const requestedEpisodes = plannedEpisodes.length || episodes;
+    const requestedRepoId = destinationDataset?.repo_id ?? repoId;
+    const requestedTask = plannedEpisodes[0]?.instruction ?? task;
     const base: Record<string, unknown> = {
       teleoperator_profile_id: leaderId,
-      repo_id: repoId,
-      name: repoId.split("/").pop() ?? repoId,
-      task,
-      episodes,
-      episode_time_s: episodeSeconds,
+      repo_id: requestedRepoId,
+      name: destinationDataset?.name ?? requestedRepoId?.split("/").pop() ?? requestedRepoId,
+      task: requestedTask,
+      episodes: requestedEpisodes,
+      // LeRobot requires an upper bound, but the operator normally ends each
+      // episode with Space. Ten minutes is only a fail-safe for a lost browser.
+      episode_time_s: MANUAL_EPISODE_FAILSAFE_SECONDS,
+      reset_time_s: plannedEpisodes.length ? MANUAL_EPISODE_FAILSAFE_SECONDS : 15,
+      timeout_seconds:
+        requestedEpisodes *
+          (MANUAL_EPISODE_FAILSAFE_SECONDS +
+            (plannedEpisodes.length ? MANUAL_EPISODE_FAILSAFE_SECONDS : 15) +
+            60) +
+        600,
+      ...(plannedEpisodes.length
+        ? {
+            episode_tasks: plannedEpisodes.map((episode) => episode.instruction),
+            episode_plan: plannedEpisodes,
+            recording_plan: {
+              source_name: roadmap?.source_name,
+              game: selectedGame?.game,
+              block: selectedGame?.block,
+              global_episode_start: plannedEpisodes[0].global_episode,
+              global_episode_end: plannedEpisodes.at(-1)?.global_episode,
+            },
+          }
+        : {}),
+      ...(destinationDataset
+        ? {
+            resume: true,
+            dataset_root: destinationDataset.local_path,
+            dataset_episode_start: destinationDataset.episodes,
+          }
+        : { resume: false, dataset_episode_start: 0 }),
     };
     if (real) {
       // No camera mapping is sent: the server reads it off the follower profile
@@ -4201,7 +5490,10 @@ function CollectStudio({
     repoId,
     task,
     episodes,
-    episodeSeconds,
+    roadmap,
+    selectedGame,
+    remainingPlannedEpisodes,
+    destinationDataset,
     workspaceConfirmed,
     scenarioId,
     openViewer,
@@ -4225,9 +5517,224 @@ function CollectStudio({
 
   const active = activeJobFor(jobs, ["recording", "sim_recording"]);
   const approval = pendingApprovalFor(jobs, ["recording", "sim_recording"]);
+  const activeEpisodePlan = Array.isArray(active?.parameters.episode_plan)
+    ? (active.parameters.episode_plan as PlannedEpisode[])
+    : [];
+  const activeDatasetStart = Number(active?.parameters.dataset_episode_start ?? 0);
+  const activeEpisodeTelemetry = active ? telemetry[active.id]?.episode : undefined;
+  const activeDatasetEpisode = activeEpisodeTelemetry?.episode ?? activeDatasetStart;
+  const activeRelativeEpisode = Math.max(0, activeDatasetEpisode - activeDatasetStart);
+  const resetting = activeEpisodeTelemetry?.phase === "reset";
+  const activeEpisodeCount = Math.max(
+    1,
+    Number(active?.parameters.episodes ?? (activeEpisodePlan.length || 1)),
+  );
+  const lastPlannedEpisode = activeRelativeEpisode >= activeEpisodeCount - 1;
+  const recordingUiPhase: RecordingUiPhase =
+    active?.state === "stopping" ||
+    activeEpisodeTelemetry?.phase === "stopping" ||
+    recordingTransition === "stopping"
+      ? "stopping"
+      : activeEpisodeTelemetry?.phase === "saved"
+        ? "saved"
+        : activeEpisodeTelemetry?.phase === "encoding" || recordingTransition === "encoding"
+          ? "encoding"
+          : resetting
+            ? "reset"
+            : activeEpisodeTelemetry?.phase === "recording"
+              ? "recording"
+              : "starting";
+  const activePlannedEpisode = activeEpisodePlan[activeRelativeEpisode] ?? null;
+  const nextPlannedEpisode = resetting
+    ? activeEpisodePlan[activeRelativeEpisode + 1] ?? null
+    : null;
+  const recordingCameraRoles =
+    active?.kind === "recording"
+      ? Object.keys(active.resolved_targets?.camera_profile_ids ?? {}).sort()
+      : [];
+  const recordingEvents = active ? telemetry[active.id]?.events ?? [] : [];
+  const lastCameraIncidentIndex = recordingEvents
+    .map(
+      (event) =>
+        event.phase === "camera:incident_during_take" ||
+        event.phase === "camera:take_invalidated",
+    )
+    .lastIndexOf(true);
+  const lastRecordingStartIndex = recordingEvents
+    .map((event) => event.phase === "recording")
+    .lastIndexOf(true);
+  const unresolvedCameraIncident =
+    lastCameraIncidentIndex > lastRecordingStartIndex
+      ? recordingEvents[lastCameraIncidentIndex]
+      : null;
+  const recordingControlsLocked =
+    active?.state !== "running" ||
+    recordingCommand?.state === "sending" ||
+    ["encoding", "saved", "stopping", "starting"].includes(recordingUiPhase);
+  const recordingPhaseGuidance: Record<
+    RecordingUiPhase,
+    { kicker: string; title: string; detail: string }
+  > = {
+    starting: {
+      kicker: "RECORDER HAZIRLANIYOR",
+      title: "İlk episode sinyali bekleniyor",
+      detail: "Kayıt başladı bildirimi gelmeden kolu hareket ettirme ve SPACE'e basma.",
+    },
+    recording: {
+      kicker: "KAYIT AKTİF",
+      title: "Şimdi görevi tamamla ve kolu güvenli konuma getir",
+      detail: lastPlannedEpisode
+        ? "Bu son episode: tamamlanınca SPACE'e bir kez bas. Reset olmadan otomatik kaydedilip oturum kapanır."
+        : "Tamamlanınca SPACE'e bir kez bas. Bu ilk basış yalnızca çekimi kapatır ve reset aşamasını açar; henüz diske kaydetmez.",
+    },
+    reset: {
+      kicker: "RESET AŞAMASI · DATASET'E YAZILMIYOR",
+      title: "Sahneyi sıradaki episode için hazırla",
+      detail:
+        "Taşı geri al/bırak talimatını uygula, sıradaki hedef parçasını pickup alanına koy ve hedef hücreye elle yerleştirme. Başlangıç sahnesi hazır olduğunda SPACE'e ikinci kez bas; episode o zaman kodlanır ve sıradaki kayıt başlar.",
+    },
+    encoding: {
+      kicker: "EPISODE KAYDEDİLİYOR",
+      title: "Video ve parquet diske yazılıyor — bekle",
+      detail:
+        "Bu aşamada SPACE, tekrar çek veya durdur komutu gönderme. 'Diske kaydedildi' olayı ve sıradaki görev görünene kadar kolu kullanma.",
+    },
+    saved: {
+      kicker: "EPISODE DİSKE KAYDEDİLDİ",
+      title: lastPlannedEpisode ? "Son episode tamamlandı" : "Sıradaki episode hazırlanıyor",
+      detail: lastPlannedEpisode
+        ? "Dataset finalize edilirken bekle; donanım bağlantıları otomatik kapanacak."
+        : "Yeni 'KAYIT AKTİF' bildirimi gelmeden sıradaki harekete başlama.",
+    },
+    stopping: {
+      kicker: "OTURUM SONLANDIRILIYOR",
+      title: "Dataset finalize ediliyor",
+      detail: "Bağlantılar güvenli biçimde kapanana ve iş tamamlandı görünene kadar bekle.",
+    },
+  };
+  const spaceEnding = useRef(false);
+
+  useEffect(() => {
+    setRecordingCommand(null);
+    setRecordingStatus(null);
+    setRecordingTransition(null);
+  }, [active?.id]);
+
+  useEffect(() => {
+    const phase = activeEpisodeTelemetry?.phase;
+    if (phase === "recording" || phase === "reset") {
+      setRecordingTransition(null);
+    } else if (phase === "encoding") {
+      setRecordingTransition("encoding");
+    } else if (phase === "stopping") {
+      setRecordingTransition("stopping");
+    }
+  }, [activeEpisodeTelemetry?.at, activeEpisodeTelemetry?.phase]);
+
+  useEffect(() => {
+    if (!active || !["recording", "sim_recording"].includes(active.kind)) return;
+    let disposed = false;
+    const load = () =>
+      void api
+        .get<RecordingStatus>(`/recordings/${encodeURIComponent(active.id)}/status`)
+        .then((status) => {
+          if (!disposed) setRecordingStatus(status);
+        })
+        .catch(() => {
+          if (!disposed) setRecordingStatus(null);
+        });
+    load();
+    const timer = window.setInterval(load, 1000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [active?.id, active?.kind]);
+
+  const sendRecordingControl = useCallback(
+    async (key: RecordingCommandState["key"]) => {
+      if (!active || active.state !== "running") return;
+      const waitingMessages: Record<RecordingCommandState["key"], string> = {
+        end_episode: resetting
+          ? "İkinci SPACE gönderildi; resetin kapanması ve episode'un diske yazılması bekleniyor…"
+          : lastPlannedEpisode
+            ? "Son çekim için SPACE gönderildi; otomatik kaydetme onayı bekleniyor…"
+            : "İlk SPACE gönderildi; çekimin kapanıp reset aşamasına geçmesi bekleniyor…",
+        rerecord_episode: "Bu take'i silme komutu gönderildi; recorder onayı bekleniyor…",
+        stop_recording: "Kaydet ve bitir komutu gönderildi; recorder onayı bekleniyor…",
+      };
+      const successMessages: Record<RecordingCommandState["key"], string> = {
+        end_episode: resetting
+          ? "İkinci SPACE doğrulandı. Episode kodlanıp diske yazılıyor; bekle."
+          : lastPlannedEpisode
+            ? "Son episode kapandı. Reset yok; otomatik kodlanıp diske yazılıyor."
+            : "İlk SPACE doğrulandı. Çekim bitti; şimdi sahneyi resetle, sonra ikinci kez SPACE'e bas.",
+        rerecord_episode: resetting
+          ? "Recorder doğruladı. Bu take silindi; aynı episode şimdi yeniden kayıt olarak başlıyor."
+          : "Recorder doğruladı. Bu take kaydedilmeyecek; sahneyi resetledikten sonra aynı görev tekrar açılacak.",
+        stop_recording:
+          "Recorder doğruladı. Mevcut take kaydediliyor ve dataset finalize ediliyor.",
+      };
+      setRecordingCommand({ key, state: "sending", message: waitingMessages[key] });
+      const result = await onInput(active.id, key);
+      if (result != null) {
+        if (key === "stop_recording") setRecordingTransition("stopping");
+        if (key === "end_episode" && (resetting || lastPlannedEpisode)) {
+          setRecordingTransition("encoding");
+        }
+      }
+      setRecordingCommand(
+        result == null
+          ? {
+              key,
+              state: "failed",
+              message:
+                "Recorder komutu doğrulamadı. Tekrar basmadan önce aşağıdaki disk sayacını ve kayıt fazını kontrol et.",
+            }
+          : { key, state: "acknowledged", message: successMessages[key] },
+      );
+    },
+    [active, lastPlannedEpisode, onInput, resetting],
+  );
+
+  useEffect(() => {
+    if (!active || !["recording", "sim_recording"].includes(active.kind)) return;
+    if (active.state !== "running") return;
+
+    const finishEpisode = (event: KeyboardEvent) => {
+      if (event.code !== "Space" || event.repeat) return;
+      const target = event.target;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        target instanceof HTMLButtonElement ||
+        (target instanceof HTMLElement && target.isContentEditable)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      if (spaceEnding.current || recordingControlsLocked) return;
+      spaceEnding.current = true;
+      void sendRecordingControl("end_episode").finally(() => {
+        window.setTimeout(() => {
+          spaceEnding.current = false;
+        }, 700);
+      });
+    };
+
+    window.addEventListener("keydown", finishEpisode);
+    return () => window.removeEventListener("keydown", finishEpisode);
+  }, [active, recordingControlsLocked, sendRecordingControl]);
   const blocked = Boolean(preview && !preview.preflight.allowed);
   const simReady = Boolean(scenario && backends?.mujoco_installed);
-  const ready = leaderId && (real ? robotId && workspaceConfirmed && !blocked : simReady);
+  const ready = Boolean(
+    parameters.repo_id &&
+      leaderId &&
+      planOrderMatches &&
+      (!selectedGame || remainingPlannedEpisodes.length > 0) &&
+      (real ? robotId && workspaceConfirmed && !blocked : simReady),
+  );
 
   return (
     <>
@@ -4258,6 +5765,117 @@ function CollectStudio({
             ? "Follower gerçekten hareket eder. Onay kartı, çalışma alanı teyidi ve acil durdurma bu yüzden burada."
             : "Follower hiç açılmaz, leader yalnızca okunur — bu oturum bir eklemi oynatamaz. Bir görevi gerçek kolda kaydetmeden önce prova etmenin yeri burası."}
         </p>
+
+        <div className="recording-plan-card">
+          <div className="recording-plan-head">
+            <div>
+              <strong>Episode planı</strong>
+              <span>Güncel XOX HTML çizelgesini bir kez yükle; oyun komutları sırayla gelir.</span>
+            </div>
+            <label className="secondary-button file-button">
+              <HardDrive size={15} />
+              {roadmap ? "Planı güncelle" : "HTML planını yükle"}
+              <input
+                type="file"
+                accept=".html,text/html"
+                onChange={(event) => {
+                  const file = event.currentTarget.files?.[0];
+                  void importRoadmap(file);
+                  event.currentTarget.value = "";
+                }}
+              />
+            </label>
+          </div>
+          {roadmap && (
+            <>
+              <div className="plan-source-line">
+                <Tag tone="green">{roadmap.games.length} oyun</Tag>
+                <Tag>{roadmap.total_episodes} episode</Tag>
+                <span>{roadmap.source_name}</span>
+                <button
+                  className="table-action"
+                  onClick={() => {
+                    setRoadmap(null);
+                    window.localStorage.removeItem(ROADMAP_STORAGE_KEY);
+                  }}
+                >
+                  Planı kaldır
+                </button>
+              </div>
+              <div className="form-grid plan-select-grid">
+                <label>
+                  Kaydedilecek oyun
+                  <select
+                    value={selectedGameNumber}
+                    onChange={(event) => setSelectedGameNumber(Number(event.target.value))}
+                  >
+                    {roadmap.games.map((game) => (
+                      <option key={game.game} value={game.game}>
+                        Oyun {game.game} · Blok {game.block} · #{String(
+                          game.episodes[0].global_episode,
+                        ).padStart(3, "0")}
+                        –#{String(game.episodes.at(-1)?.global_episode ?? 0).padStart(3, "0")}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Hedef dataset
+                  <select
+                    value={destinationDatasetId}
+                    onChange={(event) => setDestinationDatasetId(event.target.value)}
+                  >
+                    <option value="new">Yeni dataset · episode 0'dan başla</option>
+                    {datasets
+                      .filter((dataset) => dataset.repo_id && dataset.local_path)
+                      .map((dataset) => (
+                        <option key={dataset.id} value={dataset.id}>
+                          Devam et · {dataset.name} · {dataset.episodes} episode
+                        </option>
+                      ))}
+                  </select>
+                </label>
+              </div>
+              {!planOrderMatches && selectedGame && (
+                <div className="inline-warning">
+                  <CircleAlert size={16} />
+                  <span>
+                    Bu hedefin sıradaki global episode'u #{String(
+                      expectedGlobalEpisode,
+                    ).padStart(3, "0")}; Oyun {selectedGame.game} ise #
+                    {String(selectedQueueStart ?? selectedGameStart).padStart(3, "0")} ile devam
+                    ediyor. Yanlış oyunu yanlış dataset'e eklemeyi engelledim.
+                  </span>
+                </div>
+              )}
+              {planOrderMatches && destinationDataset && remainingPlannedEpisodes.length > 0 && (
+                <div className="inline-note">
+                  <CircleCheck size={16} />
+                  <span>
+                    Bu dataset'teki ilk {destinationDataset.episodes} episode korunacak; yalnızca
+                    #{String(remainingPlannedEpisodes[0].global_episode).padStart(3, "0")}
+                    {remainingPlannedEpisodes.length > 1
+                      ? `–#${String(remainingPlannedEpisodes.at(-1)?.global_episode ?? 0).padStart(3, "0")}`
+                      : ""} kuyruğa alınacak.
+                  </span>
+                </div>
+              )}
+              {selectedGameComplete && selectedGame && destinationDataset && (
+                <div className="inline-note">
+                  <CircleCheck size={16} />
+                  <span>
+                    Oyun {selectedGame.game} · Blok {selectedGame.block} bu dataset için tamamlandı:
+                    {" "}
+                    {selectedGame.episodes.length}/{selectedGame.episodes.length} episode kaydedildi.
+                    Yeni kayıt başlatılmaz.
+                  </span>
+                </div>
+              )}
+              {selectedGame && <GamePlanQueue game={selectedGame} />}
+            </>
+          )}
+          {roadmapError && <div className="inline-error">{roadmapError}</div>}
+        </div>
 
         <div className="form-grid">
           {real ? (
@@ -4307,32 +5925,49 @@ function CollectStudio({
               </label>
             </>
           )}
-          <label className="form-span">
-            Dataset adı
-            <input value={repoId} onChange={(event) => setRepoId(event.target.value)} />
-          </label>
-          <label className="form-span">
-            Görev metni (politikanın göreceği talimat)
-            <input value={task} onChange={(event) => setTask(event.target.value)} />
-          </label>
-          <label>
-            Bölüm
-            <input
-              type="number"
-              min={1}
-              value={episodes}
-              onChange={(event) => setEpisodes(Number(event.target.value))}
-            />
-          </label>
-          <label>
-            Bölüm süresi (sn)
-            <input
-              type="number"
-              min={1}
-              value={episodeSeconds}
-              onChange={(event) => setEpisodeSeconds(Number(event.target.value))}
-            />
-          </label>
+          {destinationDataset === null ? (
+            <label className="form-span">
+              Dataset repo ID
+              <input value={repoId} onChange={(event) => setRepoId(event.target.value)} />
+            </label>
+          ) : (
+            <div className="form-span destination-summary">
+              <strong>{destinationDataset.repo_id}</strong>
+              <span>
+                Mevcut {destinationDataset.episodes} episode korunur; bu oyun aynı dataset'e
+                {remainingPlannedEpisodes.length > 0
+                  ? ` ${remainingPlannedEpisodes.length} eksik episode ile devam eder.`
+                  : " tamamlanmış görünüyor."}
+              </span>
+            </div>
+          )}
+          {!selectedGame && (
+            <>
+              <label className="form-span">
+                Görev metni (politikanın göreceği talimat)
+                <input value={task} onChange={(event) => setTask(event.target.value)} />
+              </label>
+              <label>
+                Bölüm
+                <input
+                  type="number"
+                  min={1}
+                  value={episodes}
+                  onChange={(event) => setEpisodes(Number(event.target.value))}
+                />
+              </label>
+            </>
+          )}
+          <div className="manual-recording-hint">
+            <strong>Süre yok</strong>
+            <span>
+              {selectedGame
+                ? selectedGameComplete
+                  ? `Oyun ${selectedGame.game} tamamlandı · sırada kayıt yok.`
+                  : `${remainingPlannedEpisodes.length} komut sırada · SPACE ile bölüm/reset ilerler.`
+                : "Görev bitince SPACE — bölüm kaydedilir."}
+            </span>
+          </div>
         </div>
 
         {!real && (
@@ -4410,7 +6045,7 @@ function CollectStudio({
                   teleoperator_profile_id: leaderId,
                   scenario_id: scenarioId,
                   open_viewer: openViewer,
-                  episode_time_s: episodeSeconds,
+                  episode_time_s: SIM_REHEARSAL_SECONDS,
                   workspace_confirmed: true,
                 })
               }
@@ -4436,13 +6071,194 @@ function CollectStudio({
             title="Kayıt sürüyor"
             subtitle={String(active.parameters.repo_id ?? "")}
             action={
-              <button className="danger-button" onClick={() => void onCancel(active.id)}>
-                <Square size={15} />
-                Durdur
-              </button>
+              <Tag tone={active.state === "running" ? "green" : "amber"}>
+                {active.state === "running" ? "RECORDER AKTİF" : active.state.toUpperCase()}
+              </Tag>
             }
           />
-          <div className="sim-live">
+          <section
+            className={`recording-phase-banner ${recordingUiPhase}`}
+            role="status"
+            aria-live="polite"
+          >
+            <div className="recording-phase-beacon">
+              {recordingUiPhase === "encoding" || recordingUiPhase === "starting" ? (
+                <LoaderCircle className="spin" size={24} />
+              ) : recordingUiPhase === "saved" ? (
+                <CircleCheck size={24} />
+              ) : recordingUiPhase === "stopping" ? (
+                <Square size={22} />
+              ) : (
+                <Radio size={24} />
+              )}
+            </div>
+            <div className="recording-phase-copy">
+              <span>{recordingPhaseGuidance[recordingUiPhase].kicker}</span>
+              <strong>{recordingPhaseGuidance[recordingUiPhase].title}</strong>
+              <p>{recordingPhaseGuidance[recordingUiPhase].detail}</p>
+            </div>
+            <div className="recording-space-map" aria-label="Space tuşu kayıt akışı">
+              {lastPlannedEpisode ? (
+                <code>KAYIT → SPACE → KODLA/KAYDET → OTURUMU BİTİR</code>
+              ) : (
+                <code>KAYIT → SPACE #1 → RESET → SPACE #2 → KAYDET → SIRADAKİ</code>
+              )}
+            </div>
+          </section>
+          {unresolvedCameraIncident && (
+            <section className="recording-camera-incident" role="alert" aria-live="assertive">
+              <CircleAlert size={24} />
+              <div>
+                <span>KAMERA KALİTE KAPISI</span>
+                <strong>Mevcut take kaydedilmeyecek</strong>
+                {recordingUiPhase === "reset" ? (
+                  <p>
+                    Geçersiz buffer henüz diske yazılmadı. Aynı episode için başlangıç sahnesini
+                    yeniden hazırla; hazır olduğunda SPACE'e yalnızca bir kez bas. Buffer silinir
+                    ve aynı episode'un temiz çekimi başlar.
+                  </p>
+                ) : (
+                  <p>
+                    Kamera akışı kesilip yeniden açıldı. Kolu güvenli konuma getir ve SPACE'e bir
+                    kez bas; recorder reset aşamasına geçip bu buffer'ı otomatik silecek. Sahneyi
+                    hazırladıktan sonra SPACE ile aynı episode'u yeniden başlat.
+                  </p>
+                )}
+              </div>
+            </section>
+          )}
+          {activePlannedEpisode && (
+            <div
+              className={`active-plan-card ${recordingUiPhase === "reset" ? "resetting" : "recording"}`}
+            >
+              {recordingUiPhase === "reset" ? (
+                <>
+                  <div className="active-plan-kicker">
+                    Episode #{String(activePlannedEpisode.global_episode).padStart(3, "0")} çekimi bitti
+                  </div>
+                  <strong>
+                    {activePlannedEpisode.after === "undo"
+                      ? "Bu taşı tahtadan geri al."
+                      : "Taşı tahtada bırak."}
+                  </strong>
+                  {nextPlannedEpisode && (
+                    <div className="next-plan-task">
+                      <span>
+                        Sıradaki #{String(nextPlannedEpisode.global_episode).padStart(3, "0")} ·
+                        başlangıç tahtası <code>{nextPlannedEpisode.board_before}</code>
+                      </span>
+                      <strong>{nextPlannedEpisode.instruction}</strong>
+                      <span>
+                        {nextPlannedEpisode.piece} parçasını pickup alanına koy; hedef hücreye
+                        elle yerleştirme.
+                      </span>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
+                  <div className="active-plan-kicker">
+                    Oyun {activePlannedEpisode.game} · Blok {activePlannedEpisode.block} · Episode
+                    #{String(activePlannedEpisode.global_episode).padStart(3, "0")}
+                  </div>
+                  <strong>{activePlannedEpisode.instruction}</strong>
+                  <span>
+                    Başlangıç tahtası <code>{activePlannedEpisode.board_before}</code> · işlem sonrası {" "}
+                    {activePlannedEpisode.after === "undo" ? "geri al" : "tahtada bırak"}
+                  </span>
+                </>
+              )}
+            </div>
+          )}
+          <div className="recording-save-status" aria-live="polite">
+            <div className="recording-save-icon">
+              {recordingStatus?.saved_episodes ? <CircleCheck size={21} /> : <HardDrive size={21} />}
+            </div>
+            <div>
+              <strong>
+                {recordingStatus
+                  ? `Diske kaydedildi: ${recordingStatus.saved_episodes} / ${
+                      recordingStatus.dataset_episode_start + recordingStatus.planned_episodes
+                    } episode`
+                  : "Dataset diski okunuyor…"}
+              </strong>
+              <span>
+                {recordingStatus
+                  ? `${recordingStatus.saved_frames.toLocaleString("tr-TR")} kalıcı frame · ` +
+                    `${recordingStatus.buffered_frames.toLocaleString("tr-TR")} frame mevcut take buffer'ında`
+                  : "İlk sayı yalnızca LeRobot save_episode tamamlandığında artar."}
+              </span>
+              {recordingStatus && (
+                <small>
+                  {recordingStatus.buffered_frames > 0
+                    ? "Buffer henüz episode değildir; reseti bitirip sıradakine geçtiğinde kalıcı olur."
+                    : recordingStatus.metadata_present
+                      ? "Disk metadata'sı mevcut."
+                      : "Henüz kalıcı episode metadata'sı oluşmadı."}
+                </small>
+              )}
+            </div>
+          </div>
+          {recordingCommand && (
+            <div
+              className={`recording-command-feedback ${recordingCommand.state}`}
+              role="status"
+              aria-live="assertive"
+            >
+              {recordingCommand.state === "sending" ? (
+                <LoaderCircle className="spin" size={18} />
+              ) : recordingCommand.state === "acknowledged" ? (
+                <CircleCheck size={18} />
+              ) : (
+                <CircleAlert size={18} />
+              )}
+              <div>
+                <strong>
+                  {recordingCommand.state === "sending"
+                    ? "Recorder yanıtı bekleniyor"
+                    : recordingCommand.state === "acknowledged"
+                      ? "Komut uygulandı"
+                      : "Komut doğrulanmadı"}
+                </strong>
+                <span>{recordingCommand.message}</span>
+              </div>
+            </div>
+          )}
+          <section className="recording-event-log" aria-live="polite">
+            <div className="recording-event-log-head">
+              <div>
+                <TerminalSquare size={17} />
+                <strong>Canlı kayıt günlüğü</strong>
+              </div>
+              <span>en yeni olay üstte</span>
+            </div>
+            <div className="recording-event-list">
+              {recordingEvents.length > 0 ? (
+                [...recordingEvents].reverse().map((event, index) => {
+                  const copy = recordingEventCopy(event);
+                  return (
+                    <div
+                      className={`recording-event ${copy.tone}`}
+                      key={`${event.at}-${event.phase}-${event.episode ?? "none"}-${index}`}
+                    >
+                      <time dateTime={event.at}>
+                        {new Date(event.at).toLocaleTimeString("tr-TR", { hour12: false })}
+                      </time>
+                      <div>
+                        <strong>{copy.title}</strong>
+                        <span>{copy.detail}</span>
+                      </div>
+                    </div>
+                  );
+                })
+              ) : (
+                <div className="recording-event-empty">
+                  Recorder hazırlanıyor; ilk lifecycle olayı burada görünecek.
+                </div>
+              )}
+            </div>
+          </section>
+          <div className={active.kind === "recording" ? "recording-live" : "sim-live"}>
             <div>
               <div className="fact-row">
                 <Telemetry
@@ -4477,16 +6293,103 @@ function CollectStudio({
                 <figcaption>kaydedilen kare</figcaption>
               </figure>
             )}
+            {active.kind === "recording" && recordingCameraRoles.length > 0 && (
+              <div className="recording-camera-grid">
+                {recordingCameraRoles.map((role) => (
+                  <figure className="recording-camera" key={role}>
+                    <img
+                      key={`${active.id}-${role}-${liveAttempt}`}
+                      src={`/api/recordings/${encodeURIComponent(active.id)}/cameras/${encodeURIComponent(role)}.mjpg?try=${liveAttempt}`}
+                      alt={`${role} kayıt görüntüsü`}
+                      onError={() =>
+                        window.setTimeout(() => setLiveAttempt((attempt) => attempt + 1), 1500)
+                      }
+                    />
+                    <figcaption>
+                      <strong>{role}</strong>
+                      <span>24 FPS canlı · dataset ile aynı kare kaynağı</span>
+                    </figcaption>
+                  </figure>
+                ))}
+              </div>
+            )}
           </div>
-          {/* Both recorders now take the same three requests, so both get the
-              panel that sends them. The simulated one was left out and could
-              only be cancelled -- which kills the process and loses the take. */}
-          <LiveJobPanel
-            job={active}
-            telemetry={telemetry[active.id]}
-            onInput={onInput}
-            onCancel={onCancel}
-          />
+          {active.kind === "recording" && (
+            <div className={`space-to-finish ${recordingUiPhase}`}>
+              <kbd>SPACE</kbd>
+              <div>
+                <strong>
+                  {recordingUiPhase === "reset"
+                    ? "SPACE #2 · sahne hazır, episode'u kaydet"
+                    : recordingUiPhase === "recording"
+                      ? lastPlannedEpisode
+                        ? "SPACE · son episode'u kapat ve kaydet"
+                        : "SPACE #1 · çekimi kapat ve resete geç"
+                      : "Şu anda SPACE kullanma"}
+                </strong>
+                <span>
+                  {recordingUiPhase === "reset"
+                    ? "Geri al/bırak ve sıradaki başlangıç sahnesini kontrol ettikten sonra bir kez bas."
+                    : recordingUiPhase === "recording"
+                      ? "Görev tamamen başarılı ve kol güvenli konumdayken bir kez bas."
+                      : "Kodlama/finalize bitip KAYIT AKTİF görünene kadar bekle."}
+                </span>
+              </div>
+            </div>
+          )}
+          <div className="recording-controls">
+            <button
+              className="primary-button"
+              disabled={recordingControlsLocked}
+              onClick={() => void sendRecordingControl("end_episode")}
+            >
+              <Check size={16} />
+              {recordingUiPhase === "reset"
+                ? "SPACE #2 · kaydet ve sıradakini başlat"
+                : recordingUiPhase === "recording"
+                  ? lastPlannedEpisode
+                    ? "SPACE · son episode'u kaydet ve bitir"
+                    : "SPACE #1 · çekimi bitir ve resetle"
+                  : "Episode işleniyor · bekle"}
+            </button>
+            <button
+              className="secondary-button"
+              disabled={
+                recordingControlsLocked ||
+                !["recording", "reset"].includes(recordingUiPhase)
+              }
+              onClick={() => void sendRecordingControl("rerecord_episode")}
+            >
+              <RefreshCw size={15} />
+              {recordingUiPhase === "reset"
+                ? "Bu take'i sil · aynı episode'u şimdi yeniden başlat"
+                : "Bu take'i sil · aynı episode'u tekrar çek"}
+            </button>
+            <button
+              className="secondary-button"
+              disabled={recordingControlsLocked}
+              onClick={() => void sendRecordingControl("stop_recording")}
+            >
+              <Square size={15} />
+              Bu take'i kaydet · oturumu bitir
+            </button>
+            <button
+              className="danger-button quiet"
+              disabled={recordingControlsLocked}
+              onClick={() => {
+                if (
+                  window.confirm(
+                    "Mevcut take kaydedilmeyecek. Daha önce diske yazılmış episode'lar korunacak. Oturumu bitirelim mi?",
+                  )
+                ) {
+                  void onCancel(active.id);
+                }
+              }}
+            >
+              <X size={15} />
+              Bu take'i at · oturumu bitir
+            </button>
+          </div>
         </Panel>
       )}
 

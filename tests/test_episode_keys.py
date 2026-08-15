@@ -69,7 +69,8 @@ def test_a_sequence_this_recorder_does_not_answer_to_is_dropped() -> None:
 
 
 def test_noise_between_sequences_is_ignored() -> None:
-    actions, _ = decode_episode_keys(b"junk\x1b[Cmore")
+    # n/r/q are intentional one-byte controls, so noise must exclude them.
+    actions, _ = decode_episode_keys(b"xyz\x1b[Cabc")
 
     assert actions == [END_EPISODE]
 

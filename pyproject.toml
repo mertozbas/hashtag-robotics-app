@@ -22,6 +22,9 @@ dependencies = [
   # so101 extra unresolvable rather than merely old.
   "huggingface-hub>=1.0,<2",
   "packaging>=24.2",
+  # Managed robot jobs must be identifiable after a control-plane restart on
+  # macOS as well as Linux; Darwin has no /proc process metadata.
+  "psutil>=7,<8",
   "pydantic>=2.11,<3",
   "pydantic-settings>=2.10,<3",
   "pyserial>=3.5,<4",
@@ -54,7 +57,7 @@ sim = [
   "opencv-python-headless>=4.10,<5",
 ]
 so101 = [
-  "lerobot[core_scripts,feetech]>=0.6,<0.7",
+  "lerobot[core_scripts,feetech,smolvla]>=0.6,<0.7",
 ]
 training = [
   "lerobot[training]>=0.6,<0.7",
@@ -62,6 +65,8 @@ training = [
 
 [project.scripts]
 hashtag-robotics = "hashtag_robotics.cli:app"
+hashtag-lerobot-record = "hashtag_robotics.lerobot_wrappers:record_main"
+hashtag-lerobot-rollout = "hashtag_robotics.lerobot_wrappers:rollout_main"
 
 [tool.hatch.version]
 path = "src/hashtag_robotics/__init__.py"
@@ -72,6 +77,8 @@ packages = ["src/hashtag_robotics"]
 [tool.hatch.build]
 include = [
   "src/hashtag_robotics/**/*.py",
+  "src/hashtag_robotics/**/*.json",
+  "src/hashtag_robotics/**/*.swift",
   "src/hashtag_robotics/web/**/*",
 ]
 artifacts = [

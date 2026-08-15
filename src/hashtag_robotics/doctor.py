@@ -13,6 +13,7 @@ from serial.tools import list_ports
 
 from hashtag_robotics import __version__
 from hashtag_robotics.config import Settings
+from hashtag_robotics.discovery import discover_macos_cameras
 from hashtag_robotics.hardware import resolve_command
 from hashtag_robotics.identify import TORQUE_ENABLE, lerobot_torque_register
 from hashtag_robotics.models import (
@@ -421,6 +422,24 @@ class DoctorService:
         )
 
     def _camera_device_check(self) -> DoctorCheck:
+        if platform.system() == "Darwin":
+            # Doctor is polled by the dashboard. macOS camera enumeration is
+            # active I/O (system_profiler + AVFoundation) and can stall a UVC
+            # stream that LeRobot already owns, so this health read must never
+            # refresh topology. Startup and the explicit scan action populate
+            # the shared snapshot through the lease-aware DiscoveryService.
+            cameras = discover_macos_cameras(auto_refresh=False)
+            return DoctorCheck(
+                code="camera.devices",
+                label="Camera devices",
+                status=CheckStatus.PASS if cameras else CheckStatus.WARNING,
+                detail=(
+                    f"{len(cameras)} camera(s) resolved through AVFoundation."
+                    if cameras
+                    else "No AVFoundation camera found; no-camera teleoperation stays available."
+                ),
+                remediation=None if cameras else "Connect a USB camera and scan again.",
+            )
         by_id = Path("/dev/v4l/by-id")
         cameras = sorted(item.name for item in by_id.iterdir()) if by_id.is_dir() else []
         if platform.system() != "Linux":

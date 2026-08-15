@@ -1,29 +1,71 @@
 from __future__ import annotations
 
+import asyncio
+import subprocess
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from lerobot.cameras.configs import ColorMode
 
+import hashtag_robotics.discovery as discovery_module
+import hashtag_robotics.doctor as doctor_module
 from hashtag_robotics.api import create_app
+from hashtag_robotics.avfoundation_uid import AVFoundationUIDCamera, _DashboardFrameRelay
 from hashtag_robotics.camera import (
     FORMAT_GAIN_THRESHOLD,
     WARMUP_FRAMES,
     CameraError,
     CameraService,
+    _ffmpeg_avfoundation_command,
+    _opencv_source,
     decode_fourcc,
     load_cv2,
 )
 from hashtag_robotics.config import Settings
-from hashtag_robotics.discovery import DiscoveryService
+from hashtag_robotics.config_avfoundation_uid import AVFoundationUIDCameraConfig
+from hashtag_robotics.discovery import (
+    DiscoveryService,
+    _parse_avfoundation_cameras,
+    _parse_avfoundation_native_cameras,
+    discover_macos_cameras,
+)
+from hashtag_robotics.doctor import DoctorService
 from hashtag_robotics.models import CameraProfile, ResourceRequest
 from hashtag_robotics.repository import Repository
 
 pytest.importorskip("cv2", reason="OpenCV ships with the [so101] extra.")
 
 WIDTH, HEIGHT, FRAMES = 64, 48, 12
+
+
+class RunningCaptureProcess:
+    def poll(self) -> None:
+        return None
+
+
+class ExitedCaptureProcess:
+    stderr = None
+
+    def poll(self) -> int:
+        return 9
+
+
+def avfoundation_camera(tmp_path: Path) -> AVFoundationUIDCamera:
+    camera = AVFoundationUIDCamera(
+        AVFoundationUIDCameraConfig(
+            unique_id="test-camera",
+            helper_path=tmp_path / "capture-helper",
+            fps=30,
+            width=WIDTH,
+            height=HEIGHT,
+        )
+    )
+    camera.process = RunningCaptureProcess()  # type: ignore[assignment]
+    return camera
 
 
 def write_clip(path: Path) -> None:
@@ -119,6 +161,376 @@ def test_the_lerobot_entry_carries_the_stable_path(service: CameraService, tmp_p
     }
 
 
+def test_macos_camera_discovery_keeps_identity_separate_from_current_index() -> None:
+    profile = """{
+      "SPCameraDataType": [{
+        "_name": "USB2.0_CAM1",
+        "spcamera_model-id": "UVC Camera VendorID_1443 ProductID_37424",
+        "spcamera_unique-id": "0x210000005a39230"
+      }]
+    }"""
+    listing = """
+[AVFoundation indev @ 0x1] AVFoundation video devices:
+[AVFoundation indev @ 0x1] [0] MacBook Pro Camera
+[AVFoundation indev @ 0x1] [1] USB2.0_CAM1
+[AVFoundation indev @ 0x1] AVFoundation audio devices:
+[AVFoundation indev @ 0x1] [0] MacBook Pro Microphone
+"""
+
+    devices = _parse_avfoundation_cameras(profile, listing)
+
+    assert len(devices) == 1
+    assert devices[0].name == "USB2.0_CAM1"
+    assert devices[0].serial_number == "0x210000005a39230"
+    assert devices[0].identity_stable is True
+    assert devices[0].transient_path == "avfoundation:1"
+    assert "avfoundation" in devices[0].capabilities
+
+
+def test_native_macos_discovery_does_not_swap_identical_camera_names() -> None:
+    # system_profiler is deliberately in the opposite order. Joining by the
+    # repeated display name would map wrist to top; the native enumeration's
+    # index and uniqueID belong to the same AVCaptureDevice and cannot drift.
+    profile = """{
+      "SPCameraDataType": [{
+        "_name": "USB2.0_CAM1",
+        "spcamera_model-id": "UVC Camera VendorID_1443 ProductID_37424",
+        "spcamera_unique-id": "usb-top"
+      }, {
+        "_name": "USB2.0_CAM1",
+        "spcamera_model-id": "UVC Camera VendorID_1443 ProductID_37424",
+        "spcamera_unique-id": "usb-wrist"
+      }]
+    }"""
+    native = "0\tusb-wrist\tUSB2.0_CAM1\n1\tusb-top\tUSB2.0_CAM1\n"
+
+    devices = _parse_avfoundation_native_cameras(profile, native)
+
+    assert [(item.serial_number, item.transient_path) for item in devices] == [
+        ("usb-wrist", "avfoundation:0"),
+        ("usb-top", "avfoundation:1"),
+    ]
+
+
+def test_uvc_identity_survives_moving_the_hub_to_another_mac_port() -> None:
+    model = "UVC Camera VendorID_1443 ProductID_37424"
+    old_profile = f'''{{
+      "SPCameraDataType": [{{
+        "_name": "USB2.0_CAM1",
+        "spcamera_model-id": "{model}",
+        "spcamera_unique-id": "0x211000005a39230"
+      }}]
+    }}'''
+    new_profile = f'''{{
+      "SPCameraDataType": [{{
+        "_name": "USB2.0_CAM1",
+        "spcamera_model-id": "{model}",
+        "spcamera_unique-id": "0x11000005a39230"
+      }}]
+    }}'''
+
+    old = _parse_avfoundation_native_cameras(old_profile, "0\t0x211000005a39230\tUSB2.0_CAM1\n")[0]
+    new = _parse_avfoundation_native_cameras(new_profile, "0\t0x11000005a39230\tUSB2.0_CAM1\n")[0]
+
+    assert old.stable_fingerprint == new.stable_fingerprint
+    assert old.id == new.id
+    assert old.serial_number != new.serial_number
+
+
+def test_two_identical_uvc_cameras_in_different_hub_sockets_stay_distinct() -> None:
+    profile = """{
+      "SPCameraDataType": []
+    }"""
+    native = "0\t0x11000005a39230\tUSB2.0_CAM1\n1\t0x12000005a39230\tUSB2.0_CAM1\n"
+
+    devices = _parse_avfoundation_native_cameras(profile, native)
+
+    assert len({item.stable_fingerprint for item in devices}) == 2
+
+
+def test_macos_camera_discovery_reuses_snapshot_until_forced(monkeypatch) -> None:
+    profile = """{
+      "SPCameraDataType": [{
+        "_name": "USB2.0_CAM1",
+        "spcamera_model-id": "UVC Camera",
+        "spcamera_unique-id": "usb-camera-1"
+      }]
+    }"""
+    native = "0\tusb-camera-1\tUSB2.0_CAM1\n"
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(tuple(command))
+        if command[0] == "system_profiler":
+            return subprocess.CompletedProcess(command, 0, stdout=profile, stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout=native, stderr="")
+
+    monkeypatch.setattr(discovery_module, "_macos_camera_cache", None)
+    monkeypatch.setattr(discovery_module, "_macos_camera_cache_at", None)
+    monkeypatch.setattr(discovery_module.subprocess, "run", fake_run)
+
+    first = discover_macos_cameras()
+    second = discover_macos_cameras()
+    refreshed = discover_macos_cameras(force=True)
+
+    assert [item.transient_path for item in first] == ["avfoundation:0"]
+    assert [item.transient_path for item in second] == ["avfoundation:0"]
+    assert [item.transient_path for item in refreshed] == ["avfoundation:0"]
+    assert len(calls) == 4  # two subprocesses for the first scan, two for force
+
+
+def test_macos_camera_snapshot_auto_refreshes_after_hotplug_interval(monkeypatch) -> None:
+    profile = """{
+      "SPCameraDataType": [{
+        "_name": "USB2.0_CAM1",
+        "spcamera_model-id": "UVC Camera",
+        "spcamera_unique-id": "0x11000005a39230"
+      }]
+    }"""
+    native = "0\t0x11000005a39230\tUSB2.0_CAM1\n"
+    calls: list[tuple[str, ...]] = []
+    now = [0.0]
+
+    def fake_run(command, **_kwargs):
+        calls.append(tuple(command))
+        if command[0] == "system_profiler":
+            return subprocess.CompletedProcess(command, 0, stdout=profile, stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout=native, stderr="")
+
+    monkeypatch.setattr(discovery_module, "_macos_camera_cache", None)
+    monkeypatch.setattr(discovery_module, "_macos_camera_cache_at", None)
+    monkeypatch.setattr(discovery_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(discovery_module.subprocess, "run", fake_run)
+
+    discover_macos_cameras(auto_refresh=True)
+    now[0] = 1.0
+    discover_macos_cameras(auto_refresh=True)
+    now[0] = 5.0
+    discover_macos_cameras(auto_refresh=True)
+
+    assert len(calls) == 4  # first scan plus one automatic refresh
+
+
+def test_doctor_camera_check_never_refreshes_macos_capture_topology(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    requests: list[tuple[bool, bool]] = []
+
+    def fake_discover(*, force: bool = False, auto_refresh: bool = False):
+        requests.append((force, auto_refresh))
+        return []
+
+    monkeypatch.setattr(doctor_module.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(doctor_module, "discover_macos_cameras", fake_discover)
+
+    DoctorService(Settings(data_dir=tmp_path, open_browser=False))._camera_device_check()
+
+    assert requests == [(False, False)]
+
+
+def test_camera_refresh_does_not_enumerate_while_capture_is_leased(
+    service: CameraService,
+    monkeypatch,
+) -> None:
+    refresh_requests: list[bool] = []
+    service.repository.acquire_leases(
+        "preview_test",
+        [ResourceRequest(resource_id="camera_test", resource_type="camera")],
+    )
+
+    def fake_cameras(*, refresh: bool = False, auto_refresh: bool = True):
+        refresh_requests.append(refresh or auto_refresh)
+        return []
+
+    monkeypatch.setattr(service.discovery, "_cameras", fake_cameras)
+
+    assert service.connected(refresh=True) == []
+    assert refresh_requests == [False]
+
+
+def test_macos_source_uses_integer_index_for_opencv_and_lerobot(
+    service: CameraService,
+) -> None:
+    profile = CameraProfile(name="USB", device_fingerprint="camera-id", semantic_name="front")
+
+    assert _opencv_source("avfoundation:1") == (
+        1,
+        "opencv/avfoundation",
+        "CAP_AVFOUNDATION",
+    )
+    assert service.lerobot_config(profile, "avfoundation:1")["index_or_path"] == 1
+
+    command = _ffmpeg_avfoundation_command(profile, 1)
+    assert command[command.index("-i") + 1] == "1:none"
+    assert command[command.index("-video_size") + 1] == "640x480"
+    assert command[command.index("-framerate") + 1] == "30"
+    assert command[command.index("-boundary_tag") + 1] == "hashtagframe"
+
+
+def test_an_invalid_macos_source_is_rejected() -> None:
+    with pytest.raises(CameraError, match="Invalid AVFoundation"):
+        _opencv_source("avfoundation:not-an-index")
+
+
+def test_closing_async_stream_closes_nested_ffmpeg_generator(
+    service: CameraService,
+    monkeypatch,
+) -> None:
+    profile = CameraProfile(name="USB", device_fingerprint="camera-id", semantic_name="wrist")
+    closed = False
+
+    async def fake_ffmpeg_stream(_profile: CameraProfile, _index: int):
+        nonlocal closed
+        try:
+            yield b"frame"
+        finally:
+            closed = True
+
+    monkeypatch.setattr(service, "resolve_path", lambda _profile: "avfoundation:0")
+    monkeypatch.setattr(service, "_async_ffmpeg_avfoundation_frames", fake_ffmpeg_stream)
+    monkeypatch.setattr("hashtag_robotics.camera.shutil.which", lambda _name: "/usr/bin/ffmpeg")
+
+    async def consume_one_frame() -> None:
+        stream = service.async_frames(profile)
+        assert await anext(stream) == b"frame"
+        await stream.aclose()
+
+    asyncio.run(consume_one_frame())
+
+    assert closed is True
+
+
+def test_avfoundation_stale_frame_waits_for_a_fresh_capture(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    numpy = pytest.importorskip("numpy")
+    camera = avfoundation_camera(tmp_path)
+    stale = numpy.zeros((HEIGHT, WIDTH, 3), dtype=numpy.uint8)
+    fresh = numpy.full((HEIGHT, WIDTH, 3), 211, dtype=numpy.uint8)
+    camera.latest_frame = stale
+    camera.latest_timestamp = time.perf_counter() - 0.12
+
+    def publish_fresh_frame() -> None:
+        time.sleep(0.02)
+        with camera.frame_lock:
+            camera.latest_frame = fresh
+            camera.latest_timestamp = time.perf_counter()
+        camera.new_frame_event.set()
+
+    publisher = threading.Thread(target=publish_fresh_frame)
+    publisher.start()
+    with caplog.at_level("WARNING"):
+        result = camera.read_latest(recovery_timeout_ms=250)
+    publisher.join(timeout=1)
+
+    assert result is fresh
+    assert "recovered from a stale frame" in caplog.text
+
+
+def test_avfoundation_genuine_frame_stall_restarts_only_its_capture_helper(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    numpy = pytest.importorskip("numpy")
+    camera = avfoundation_camera(tmp_path)
+    stale = numpy.zeros((HEIGHT, WIDTH, 3), dtype=numpy.uint8)
+    fresh = numpy.full((HEIGHT, WIDTH, 3), 127, dtype=numpy.uint8)
+    camera.latest_frame = stale
+    camera.latest_timestamp = time.perf_counter() - 0.54
+    recoveries: list[tuple[float, str]] = []
+
+    def recover(previous_timestamp: float, reason: str):
+        recoveries.append((previous_timestamp, reason))
+        return fresh
+
+    monkeypatch.setattr(camera, "_restart_capture_after_stall", recover)
+
+    result = camera.read_latest(max_age_ms=500, recovery_timeout_ms=20)
+
+    assert result is fresh
+    assert len(recoveries) == 1
+    assert "no fresh frame arrived" in recoveries[0][1]
+
+
+def test_avfoundation_capture_restart_requires_a_new_frame(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    numpy = pytest.importorskip("numpy")
+    camera = avfoundation_camera(tmp_path)
+    camera.latest_frame = numpy.zeros((HEIGHT, WIDTH, 3), dtype=numpy.uint8)
+    camera.latest_timestamp = time.perf_counter() - 0.54
+
+    def disconnect() -> None:
+        camera.process = None
+        camera.latest_frame = None
+        camera.latest_timestamp = None
+
+    def connect() -> None:
+        camera.process = RunningCaptureProcess()  # type: ignore[assignment]
+
+    monkeypatch.setattr(camera, "disconnect", disconnect)
+    monkeypatch.setattr(camera, "connect", connect)
+
+    with pytest.raises(TimeoutError, match="restarted but produced no fresh frame"):
+        camera.read_latest(max_age_ms=500, recovery_timeout_ms=20)
+
+
+def test_avfoundation_capture_restart_returns_the_reopened_helpers_frame(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    numpy = pytest.importorskip("numpy")
+    camera = avfoundation_camera(tmp_path)
+    stale = numpy.zeros((HEIGHT, WIDTH, 3), dtype=numpy.uint8)
+    fresh = numpy.full((HEIGHT, WIDTH, 3), 63, dtype=numpy.uint8)
+    camera.latest_frame = stale
+    camera.latest_timestamp = time.perf_counter() - 0.54
+    calls: list[str] = []
+
+    def disconnect() -> None:
+        calls.append("disconnect")
+        camera.process = None
+        camera.latest_frame = None
+        camera.latest_timestamp = None
+
+    def connect() -> None:
+        calls.append("connect")
+        camera.process = RunningCaptureProcess()  # type: ignore[assignment]
+        camera.latest_frame = fresh
+        camera.latest_timestamp = time.perf_counter()
+
+    monkeypatch.setattr(camera, "disconnect", disconnect)
+    monkeypatch.setattr(camera, "connect", connect)
+
+    result = camera.read_latest(max_age_ms=500, recovery_timeout_ms=20)
+
+    assert result is fresh
+    assert calls == ["disconnect", "connect"]
+
+
+def test_avfoundation_exited_helper_uses_the_local_restart_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    numpy = pytest.importorskip("numpy")
+    camera = avfoundation_camera(tmp_path)
+    fresh = numpy.full((HEIGHT, WIDTH, 3), 31, dtype=numpy.uint8)
+    camera.process = ExitedCaptureProcess()  # type: ignore[assignment]
+    recoveries: list[str] = []
+
+    def recover(_previous_timestamp: float, reason: str):
+        recoveries.append(reason)
+        return fresh
+
+    monkeypatch.setattr(camera, "_restart_capture_after_stall", recover)
+
+    assert camera.read_latest() is fresh
+    assert recoveries == ["capture process exited with code 9"]
+
+
 def test_probe_reports_measured_timing_not_the_request(
     service: CameraService,
     tmp_path: Path,
@@ -149,6 +561,7 @@ def test_frames_yield_multipart_jpeg_and_release_the_device(
     assert b"\xff\xd8" in chunks[0]
     # The generator ran to completion, so the capture was released and can reopen.
     assert service.probe(profile, samples=2)["frames_captured"] > 0
+    assert not any(thread.name.startswith("hashtag-camera-") for thread in threading.enumerate())
 
 
 def test_fourcc_is_reported_as_text() -> None:
@@ -194,6 +607,31 @@ def register_camera(client: TestClient) -> str:
     return str(profile.json()["id"])
 
 
+def test_saving_the_same_camera_twice_reuses_its_profile(camera_client: TestClient) -> None:
+    devices = camera_client.post("/api/cameras/discover").json()
+    fingerprint = devices[0]["stable_fingerprint"]
+    payload = {
+        "name": "Wrist",
+        "device_fingerprint": fingerprint,
+        "semantic_name": "wrist",
+        "width": WIDTH,
+        "height": HEIGHT,
+        "fps": 30,
+    }
+
+    first = camera_client.post("/api/cameras", json=payload).json()
+    second = camera_client.post("/api/cameras", json={**payload, "name": "Wrist renamed"}).json()
+
+    assert second["id"] == first["id"]
+    assert second["name"] == "Wrist renamed"
+    physical = [
+        item
+        for item in camera_client.get("/api/cameras").json()
+        if item["device_fingerprint"] == fingerprint
+    ]
+    assert len(physical) == 1
+
+
 def camera_leases(client: TestClient, camera_id: str) -> list[str]:
     repository = client.app.state.runtime.repository
     return [
@@ -209,6 +647,8 @@ def test_the_preview_stream_serves_jpeg_and_releases_the_camera(
     with camera_client.stream("GET", f"/api/cameras/{camera_id}/preview.mjpg") as stream:
         assert stream.status_code == 200
         assert "multipart/x-mixed-replace" in stream.headers["content-type"]
+        assert "no-store" in stream.headers["cache-control"]
+        assert stream.headers["x-accel-buffering"] == "no"
         body = b"".join(stream.iter_bytes())
 
     assert body.count(b"Content-Type: image/jpeg") > 0
@@ -295,6 +735,32 @@ def test_the_pixel_format_reaches_the_lerobot_config(
     camera.fourcc = "MJPG"
     config = service.lerobot_config(camera, "/dev/video0")
     assert config["fourcc"] == "MJPG"
+
+
+def test_the_recording_relay_encodes_the_recorder_owned_rgb_frame(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The dashboard copy comes from LeRobot's frame, not a second capture."""
+    numpy = pytest.importorskip("numpy")
+    monkeypatch.setenv("HASHTAG_RECORDING_LIVE_DIR", str(tmp_path))
+    relay = _DashboardFrameRelay("wrist", fps=30)
+    rgb = numpy.zeros((HEIGHT, WIDTH, 3), dtype=numpy.uint8)
+    rgb[:, :, 0] = 255
+
+    relay.offer(rgb, ColorMode.RGB)
+
+    deadline = time.monotonic() + 2
+    output = tmp_path / "wrist.jpg"
+    while not output.is_file() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    relay.close()
+    payload = output.read_bytes()
+    decoded = load_cv2().imdecode(numpy.frombuffer(payload, dtype=numpy.uint8), 1)
+    assert decoded is not None
+    # OpenCV decodes BGR. A red RGB source must therefore land in channel 2.
+    assert int(decoded[HEIGHT // 2, WIDTH // 2, 2]) > 240
+    assert int(decoded[HEIGHT // 2, WIDTH // 2, 0]) < 10
 
 
 def test_a_format_is_only_recommended_when_the_gain_is_real() -> None:

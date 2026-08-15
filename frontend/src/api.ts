@@ -152,7 +152,12 @@ export interface CalibrationArtifact {
   checksum: string;
   live_path: string;
   motors: Record<string, Record<string, number>>;
-  validation_result: { valid?: boolean; motor_count?: number; problems?: string[] };
+  validation_result: {
+    valid?: boolean;
+    motor_count?: number;
+    problems?: string[];
+    warnings?: string[];
+  };
   supersedes?: string | null;
   created_at: string;
 }
@@ -160,6 +165,7 @@ export interface CalibrationArtifact {
 export interface SafetyStatus {
   emergency_stop_engaged: boolean;
   physical_enabled: boolean;
+  default_max_relative_target: number;
   max_relative_target_ceiling: number;
   runtime_available: boolean;
 }
@@ -201,6 +207,27 @@ export interface TelemetrySummary {
   ranges: Record<string, { min: number; pos: number; max: number }>;
   prompt?: TelemetrySample | null;
   episode?: TelemetrySample | null;
+  /** Present only after LeRobot itself decoded a dashboard control byte. */
+  control?: TelemetrySample | null;
+  /** Bounded recording lifecycle history; retained separately from loop samples. */
+  events?: TelemetrySample[];
+}
+
+export interface RecordingStatus {
+  job_id: string;
+  job_state: string;
+  requested_repo_id: string;
+  recorded_repo_id?: string | null;
+  root: string;
+  saved_episodes: number;
+  saved_frames: number;
+  buffered_frames: number;
+  buffered_frames_by_camera: Record<string, number>;
+  fps: number;
+  metadata_present: boolean;
+  planned_episodes: number;
+  dataset_episode_start: number;
+  finalized: boolean;
 }
 
 export interface JobSnapshot {
@@ -254,10 +281,14 @@ export interface Policy {
   policy_type: string;
   checkpoint?: string | null;
   checkpoint_step?: number | null;
+  model_repo_id?: string | null;
+  model_revision?: string | null;
   source_dataset_id?: string | null;
   source_repo_id?: string | null;
   expected_features: string[];
   action_shape: number[];
+  camera_mapping: Record<string, string>;
+  empty_cameras: number;
   runtime: string;
   training_steps?: number | null;
   compatibility_status: string;
@@ -352,6 +383,7 @@ export interface SetupSlot {
   calibration_valid?: boolean | null;
   calibration_warnings: string[];
   motor_count: number;
+  max_relative_target?: number | null;
 }
 
 export interface SetupStatus {
@@ -391,16 +423,28 @@ async function ensureSession(): Promise<string> {
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const token = await ensureSession();
-  const response = await fetch(`${API_ROOT}${path}`, {
-    credentials: "same-origin",
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Hashtag-Token": token,
-      ...options?.headers,
-    },
-  });
+  const send = async () => {
+    const token = await ensureSession();
+    return fetch(`${API_ROOT}${path}`, {
+      credentials: "same-origin",
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Hashtag-Token": token,
+        ...options?.headers,
+      },
+    });
+  };
+
+  let response = await send();
+  // The token intentionally dies with the control-plane process. An already
+  // open dashboard must obtain the next process's token instead of retrying
+  // the stale one forever after a local restart.
+  if (response.status === 401) {
+    sessionToken = null;
+    sessionRequest = null;
+    response = await send();
+  }
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
     throw new Error(payload?.detail ?? `${response.status} ${response.statusText}`);
@@ -567,6 +611,14 @@ export interface DatasetEpisode {
   /** Index of the earlier episode this one is a copy of, when a merge brought
    *  the same recording in twice. Null for the first occurrence. */
   duplicate_of?: number | null;
+  videos: Array<{
+    camera: string;
+    feature: string;
+    chunk_index: number;
+    file_index: number;
+    from_timestamp: number;
+    to_timestamp: number;
+  }>;
 }
 
 export interface DatasetEpisodes {
@@ -574,4 +626,48 @@ export interface DatasetEpisodes {
   episodes: DatasetEpisode[];
   readable: boolean;
   note: string;
+}
+
+export interface PlannedEpisode {
+  global_episode: number;
+  game: number;
+  block: string;
+  instruction: string;
+  board_before: string;
+  after: "undo" | "leave";
+  piece: string;
+  target_cell: string;
+}
+
+export interface RecordingGame {
+  game: number;
+  block: string;
+  reset_instruction: string;
+  episodes: PlannedEpisode[];
+}
+
+export interface RecordingRoadmap {
+  source_name: string;
+  games: RecordingGame[];
+  total_episodes: number;
+}
+
+export interface TicTacToeMove {
+  id: string;
+  piece: "X" | "O";
+  object_name: string;
+  cell_number: number;
+  cell: string;
+  task: string;
+  episode_index: number;
+  board_robot: string;
+  board_camera: string;
+  start_pose: number[];
+}
+
+export interface TicTacToeCatalogue {
+  profile: string;
+  policy_repo_id: string;
+  policy_revision: string;
+  moves: TicTacToeMove[];
 }
