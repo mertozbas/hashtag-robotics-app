@@ -39,7 +39,6 @@ from hashtag_robotics.tic_tac_toe import (
     TIC_TAC_TOE_MAX_RELATIVE_TARGET,
     TIC_TAC_TOE_POLICY_REPO,
     TIC_TAC_TOE_POLICY_REVISION,
-    TIC_TAC_TOE_ROBOT_ID,
     TicTacToePresetError,
     canonical_tic_tac_toe_parameters,
     is_tic_tac_toe_parameters,
@@ -445,7 +444,7 @@ class SafetyService:
             and policy.model_repo_id == TIC_TAC_TOE_POLICY_REPO
             and policy.model_revision == TIC_TAC_TOE_POLICY_REVISION
         )
-        correct_robot = bool(resolved and resolved.robot_id == TIC_TAC_TOE_ROBOT_ID)
+        correct_robot = bool(resolved and resolved.robot_id and resolved.robot_calibration_revision)
         correct_limit = bool(
             resolved
             and resolved.max_relative_target is not None
@@ -469,14 +468,14 @@ class SafetyService:
                 "Bench-validated policy revision",
                 policy_matches,
                 f"Policy is pinned to {TIC_TAC_TOE_POLICY_REVISION[:12]}.",
-                "This profile only accepts the bench-validated tic-tac-toe 80K revision.",
+                "This profile only accepts the pinned Games 1-15 120K revision.",
             ),
             _check(
                 "ttt.robot_calibration",
                 "Demo-pose calibration",
                 correct_robot,
-                f"Follower uses the '{TIC_TAC_TOE_ROBOT_ID}' calibration frame.",
-                "The recorded start poses are valid only for the 'denizli' follower calibration.",
+                "Follower identity and calibration revision are resolved by the server.",
+                "Select a connected follower with an imported, verified calibration revision.",
             ),
             _check(
                 "ttt.relative_limit",

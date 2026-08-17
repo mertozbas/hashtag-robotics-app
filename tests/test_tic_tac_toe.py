@@ -49,7 +49,7 @@ def test_x7_is_pinned_to_the_successful_episode_45_contract() -> None:
     assert canonical["ttt_preset"]["board_camera"] == ".../OXO/..."
     assert canonical["fps"] == 30
     assert canonical["inference_rtc_enabled"] is False
-    assert canonical["repo_id"] == "hashtagrobotics/rollout_tic_tac_toe_80k_X-7"
+    assert canonical["repo_id"] == ("hashtagrobotics/rollout_tic_tac_toe_games_1_15_120k_X-7")
     assert "duration" not in canonical
 
 

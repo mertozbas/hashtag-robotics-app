@@ -199,7 +199,7 @@ def codes(result, status: CheckStatus) -> set[str]:
 
 def test_tic_tac_toe_profile_pins_policy_calibration_and_motion_limit(lab: Lab) -> None:
     policy = PolicyManifest(
-        name="Tic-Tac-Toe 80K",
+        name="Tic-Tac-Toe 120K",
         policy_type="smolvla",
         model_repo_id=TIC_TAC_TOE_POLICY_REPO,
         model_revision=TIC_TAC_TOE_POLICY_REVISION,
@@ -218,7 +218,11 @@ def test_tic_tac_toe_profile_pins_policy_calibration_and_motion_limit(lab: Lab) 
         parameters=parameters,
         requested_by="test",
     )
-    resolved = ResolvedTargets(robot_id="denizli", max_relative_target=5.0)
+    resolved = ResolvedTargets(
+        robot_id="portable_follower",
+        robot_calibration_revision="calibration-sha256",
+        max_relative_target=5.0,
+    )
 
     checks = lab.safety._tic_tac_toe_checks(request, resolved)
 
@@ -249,7 +253,7 @@ def test_tic_tac_toe_profile_rejects_an_unvalidated_policy_revision(lab: Lab) ->
 
     checks = lab.safety._tic_tac_toe_checks(
         request,
-        ResolvedTargets(robot_id="denizli", max_relative_target=5.0),
+        ResolvedTargets(robot_id="test_follower", max_relative_target=5.0),
     )
 
     assert next(check for check in checks if check.code == "ttt.policy_revision").status == (
@@ -445,7 +449,7 @@ def test_a_mapped_avfoundation_uid_camera_is_reported_without_an_index(
     lab.repository.upsert_entity("robot", lab.robot)
     config = {
         "type": "avfoundation_uid",
-        "unique_id": "0x211000005a39230",
+        "unique_id": "test-wrist-camera-uid",
         "helper_path": "/tmp/avfoundation-uid-capture",
         "fps": 30,
         "width": 640,
@@ -458,7 +462,7 @@ def test_a_mapped_avfoundation_uid_camera_is_reported_without_an_index(
 
     assert result.allowed is True
     check = next(item for item in result.checks if item.code == "camera.mapping_resolved")
-    assert "wrist=0x211000005a39230" in check.message
+    assert "wrist=test-wrist-camera-uid" in check.message
     assert result.resolved is not None
     assert result.resolved.cameras["wrist"] == config
 

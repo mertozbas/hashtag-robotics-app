@@ -10,7 +10,8 @@ dynamic = ["version"]
 description = "Local-first SO-101 control plane and agent-safe robotics dashboard"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
-license = { text = "Proprietary" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Hashtag Robotics" }]
 dependencies = [
   "fastapi>=0.116,<1",

@@ -619,7 +619,7 @@ function App() {
           ACTIVE_STATES.includes(job.state) &&
           job.target_mode === "real" &&
           CAMERA_MODAL_JOB_KINDS.includes(job.kind) &&
-          job.parameters.rollout_profile !== "tic_tac_toe_80k" &&
+          job.parameters.rollout_profile !== "tic_tac_toe_games_1_15_120k" &&
           Object.keys(job.resolved_targets?.camera_profile_ids ?? {}).length > 0,
       ) ?? null,
     [jobs],
@@ -958,7 +958,7 @@ function App() {
               <strong>{summary?.physical_enabled ? "HIL active" : "Locked safely"}</strong>
             </span>
           </div>
-          <span className="version">control plane v0.1.0</span>
+          <span className="version">control plane v0.2.0</span>
         </div>
       </aside>
 
@@ -2870,7 +2870,8 @@ function LiveJobPanel({
   const [tttStartPending, setTttStartPending] = useState(false);
   const [tttStopRequested, setTttStopRequested] = useState(false);
   const running = job.state === "running";
-  const ticTacToe = job.parameters.rollout_profile === "tic_tac_toe_80k";
+  const ticTacToe =
+    job.parameters.rollout_profile === "tic_tac_toe_games_1_15_120k";
   const keys = OPERATOR_KEYS[job.kind] ?? [];
   const expects = telemetry?.prompt?.expects ?? null;
   const ranges = Object.entries(telemetry?.ranges ?? {});
@@ -4334,10 +4335,10 @@ function PolicyRunner({
   const [ticTacToe, setTicTacToe] = useState<TicTacToeCatalogue | null>(null);
   const [moveId, setMoveId] = useState("X-7");
   const [repoId, setRepoId] = useState(
-    "HashtagRobotics/smolvla-tic-tac-toe-games-1-5-80k",
+    "HashtagRobotics/smolvla-tic-tac-toe-games-1-15-120k",
   );
   const [revision, setRevision] = useState("");
-  const [modelName, setModelName] = useState("Tic-Tac-Toe SmolVLA · Games 1–5 · 80K");
+  const [modelName, setModelName] = useState("Tic-Tac-Toe SmolVLA · Games 1–15 · 120K");
   const [topRole, setTopRole] = useState("top");
   const [wristRole, setWristRole] = useState("wrist");
   const [policyId, setPolicyId] = useState("");
@@ -4399,7 +4400,8 @@ function PolicyRunner({
         ? {
             policy_id: policyId,
             robot_profile_id: robotId,
-            rollout_profile: ticTacToe?.profile ?? "tic_tac_toe_80k",
+            rollout_profile:
+              ticTacToe?.profile ?? "tic_tac_toe_games_1_15_120k",
             move_id: moveId,
             device,
             workspace_confirmed: workspaceConfirmed,
@@ -4567,7 +4569,7 @@ function PolicyRunner({
                   setRolloutProfile(event.target.value as "tic_tac_toe" | "generic")
                 }
               >
-                <option value="tic_tac_toe">Tic-Tac-Toe 80K · 18 kontrollü hamle</option>
+                <option value="tic_tac_toe">Tic-Tac-Toe 120K · 18 kontrollü hamle</option>
                 <option value="generic">Generic · süreli exact task</option>
               </select>
             </label>

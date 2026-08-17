@@ -15,6 +15,7 @@ ROLLOUT_EPISODE_TASKS_ENV = "HASHTAG_ROLLOUT_EPISODE_TASKS_JSON"
 UNBOUNDED_ROLLOUT_ENV = "HASHTAG_UNBOUNDED_ROLLOUT"
 ASYNC_CHUNK_APPEND_ENV = "HASHTAG_ASYNC_CHUNK_APPEND"
 TTT_DEMO_PRESET_ENV = "HASHTAG_TTT_DEMO_PRESET_JSON"
+ROLLOUT_SEED_ENV = "HASHTAG_ROLLOUT_SEED"
 
 _TTT_JOINT_KEYS = (
     "shoulder_pan.pos",
@@ -24,6 +25,24 @@ _TTT_JOINT_KEYS = (
     "wrist_roll.pos",
     "gripper.pos",
 )
+
+
+def _seed_rollout_from_env() -> int | None:
+    raw_seed = os.environ.get(ROLLOUT_SEED_ENV)
+    if raw_seed is None:
+        return None
+    try:
+        seed = int(raw_seed)
+    except ValueError as error:
+        raise ValueError(f"{ROLLOUT_SEED_ENV} must be an integer.") from error
+    if not 0 <= seed <= 2**32 - 1:
+        raise ValueError(f"{ROLLOUT_SEED_ENV} must be between 0 and {2**32 - 1}.")
+
+    from lerobot.utils.random_utils import set_seed
+
+    set_seed(seed)
+    print(f"Hashtag rollout inference seed: {seed}", flush=True)
+    return seed
 
 
 def _register_camera() -> None:
@@ -532,4 +551,5 @@ def rollout_main() -> None:
             unbounded=os.environ.get(UNBOUNDED_ROLLOUT_ENV) == "1",
         )
 
+    _seed_rollout_from_env()
     main()

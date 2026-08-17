@@ -21,6 +21,7 @@ from hashtag_robotics.lerobot_wrappers import (
     _install_recording_lifecycle,
     _install_rollout_episode_tasks,
     _install_ttt_demo_preset,
+    _seed_rollout_from_env,
 )
 from hashtag_robotics.recording_plan import RecordingPlanError, parse_recording_roadmap
 from hashtag_robotics.repository import Repository
@@ -180,6 +181,17 @@ def test_async_append_mode_ignores_unused_delay_mismatch_without_affecting_rtc(c
     rtc_queue.last_index = 7
     assert rtc_queue._check_and_resolve_delays(8, 0) == 8
     assert "Indexes diff is not equal to real delay" in caplog.text
+
+
+def test_checkpoint_sweep_seed_is_applied_to_rollout_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+    monkeypatch.setenv("HASHTAG_ROLLOUT_SEED", "42")
+    monkeypatch.setattr("lerobot.utils.random_utils.set_seed", calls.append)
+
+    assert _seed_rollout_from_env() == 42
+    assert calls == [42]
 
 
 def test_ttt_demo_preset_homes_then_waits_for_operator_before_rollout(

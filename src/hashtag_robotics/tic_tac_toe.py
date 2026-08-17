@@ -5,10 +5,9 @@ from functools import lru_cache
 from importlib.resources import files
 from typing import Any
 
-TIC_TAC_TOE_PROFILE = "tic_tac_toe_80k"
-TIC_TAC_TOE_POLICY_REPO = "HashtagRobotics/smolvla-tic-tac-toe-games-1-5-80k"
-TIC_TAC_TOE_POLICY_REVISION = "d65f5ec4f771b4e6d21c5be78ddc18af242895a6"
-TIC_TAC_TOE_ROBOT_ID = "denizli"
+TIC_TAC_TOE_PROFILE = "tic_tac_toe_games_1_15_120k"
+TIC_TAC_TOE_POLICY_REPO = "HashtagRobotics/smolvla-tic-tac-toe-games-1-15-120k"
+TIC_TAC_TOE_POLICY_REVISION = "48a6313b7e4983781dd72919105ca691a77cd26c"
 TIC_TAC_TOE_MAX_RELATIVE_TARGET = 5.0
 
 TIC_TAC_TOE_CELLS = {
@@ -147,7 +146,7 @@ def canonical_tic_tac_toe_parameters(parameters: dict[str, Any]) -> dict[str, An
             "inference_type": "rtc",
             "inference_queue_threshold": 18,
             "inference_rtc_enabled": False,
-            "repo_id": f"hashtagrobotics/rollout_tic_tac_toe_80k_{move_id}",
+            "repo_id": f"hashtagrobotics/rollout_tic_tac_toe_games_1_15_120k_{move_id}",
             "episodes": 1,
             "episode_time_s": 86400,
             "reset_time_s": 0,

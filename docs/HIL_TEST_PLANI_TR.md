@@ -68,7 +68,7 @@ Bu test planı riskleri azaltır; tüm fiziksel riskleri ortadan kaldırmaz.
 ## 4. Yazılım hazırlığı
 
 ```bash
-cd /Users/macmert/so101-app
+cd /path/to/so101-tic-tac-toe
 uv sync --extra dev --extra agents --extra sim --extra so101
 npm --prefix frontend run build
 bash scripts/verify.sh

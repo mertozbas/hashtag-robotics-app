@@ -1,85 +1,90 @@
-# Hashtag Robotics SO-101 Control Plane
+# Hashtag Robotics SO-101 Tic-Tac-Toe
 
-Hashtag Robotics'in sattığı SO-101 leader/follower setleri için local-first,
-kurulabilir ve agent-safe robot kontrol platformu.
+An open, end-to-end reference project for printing a large tic-tac-toe set,
+running two SO-101 arms through the Hashtag Robotics local dashboard, inspecting
+the public LeRobot dataset, downloading a revision-pinned SmolVLA policy, and
+executing guarded physical rollouts.
 
-Platform; cihaz keşfi, robot profili, kalibrasyon, kamera, teleoperation,
-dataset, training, evaluation, Strands ajanları ve simülasyon işlerini tek bir
-kalıcı control plane içinde birleştirir.
+> **Experimental robotics release.** The software defaults to simulation and
+> software-only mode. A printed board plus the pretrained policy is not a
+> guarantee of successful motion: follower calibration, camera identity,
+> workspace geometry, joint limits, an accessible hardware E-STOP, and an
+> operator-approved low-speed preflight are mandatory.
 
-## Mevcut durum
+[Türkçe project overview](README_TR.md)
 
-`v0.1.0` software-only baseline tamamlandı ve fiziksel
-hardware-in-the-loop (HIL) test sınırına getirildi.
+## What is included
 
-Çalışan yüzey:
+| Layer | Location | Contents |
+| --- | --- | --- |
+| Printable game | [`hardware/tic-tac-toe`](hardware/tic-tac-toe) | OpenSCAD, STL, Bambu P2S 3MF/G-code, profiles and print notes |
+| Camera tower | [`hardware/camera-tower`](hardware/camera-tower) | Parametric source, STEP/STL/3MF, BOM and assembly notes |
+| Local control plane | [`src/hashtag_robotics`](src/hashtag_robotics) | FastAPI backend, deterministic jobs, leases, approvals, audit and safety gates |
+| Dashboard | [`frontend`](frontend) | React/TypeScript UI, packaged into the Python wheel |
+| Tic-tac-toe runner | [`agent.py`](agent.py), [`ttt-rollouts`](ttt-rollouts) | 18 fixed X/O move launchers and a vision-guided Strands workflow |
+| Artifact contract | [`config/artifacts.lock.json`](config/artifacts.lock.json) | Dataset/model revisions, feature shapes and camera mapping |
+| Training recipe | [`training`](training) | Colab A100 notebook for the published 120K run |
 
-- FastAPI local control plane ve React/TypeScript dashboard
-- SQLite persisted job, resource lease, approval ve audit
-- Read-only serial discovery ve stable device fingerprint
-- Hashtag Robot/Camera/Dataset/Policy manifestleri
-- Safe mock teleop, recording, replay ve calibration workflow'ları
-- Dataset → validation → training → policy → evaluation zinciri
-- Gerçek LeRobot `0.6.0` console-script adapter contract'ları
-- Strands Agents `1.48.0` structured planner ve deterministic command gateway
-- MuJoCo SO-101 altı-joint contract simulation
-- Remote inference TLS/latency contract
-- Doctor, capability manifest, diagnostics ve HIL checklist
-- Python wheel içine gömülü production dashboard
+Large datasets and model weights are intentionally not stored in Git. They are
+public on Hugging Face and downloaded from pinned revisions:
 
-Gerçek robot actuation varsayılan olarak kapalıdır:
+- Dataset: [`HashtagRobotics/tic-tac-toe-so101-block-a-clean-v1`](https://huggingface.co/datasets/HashtagRobotics/tic-tac-toe-so101-block-a-clean-v1) — revision `b1a5e868…`, 195 episodes, 144,723 frames, 30 FPS, two cameras and 6D state/action.
+- Dataset viewer: [LeRobot visualizer](https://huggingface.co/spaces/lerobot/visualize_dataset?path=HashtagRobotics/tic-tac-toe-so101-block-a-clean-v1)
+- Default policy: [`HashtagRobotics/smolvla-tic-tac-toe-games-1-15-120k`](https://huggingface.co/HashtagRobotics/smolvla-tic-tac-toe-games-1-15-120k) — revision `48a6313b…`, checkpoint `120000`.
+- Earlier baseline: [`HashtagRobotics/smolvla-tic-tac-toe-games-1-5-80k`](https://huggingface.co/HashtagRobotics/smolvla-tic-tac-toe-games-1-5-80k) — revision `d65f5ec4…`, checkpoint `080000`.
 
-```text
-HASHTAG_ENABLE_PHYSICAL=false
-```
+The published model card currently contains no physical success-rate result.
+This repository therefore makes no task-success or production-readiness claim.
 
-Fiziksel test sırasında bile hareket; resolved resource, calibration, joint
-limit, emergency stop, deterministic preflight ve tek kullanımlık kullanıcı
-approval'ı olmadan başlayamaz.
+## 1. Print the hardware
 
-## Mimari ayrım
+Start with [`hardware/tic-tac-toe/PRINTING.md`](hardware/tic-tac-toe/PRINTING.md)
+and [`hardware/camera-tower/README.md`](hardware/camera-tower/README.md).
 
-| Katman | Sorumluluk |
-|---|---|
-| LeRobot | SO-101 donanım, calibration, dataset, training ve rollout |
-| Strands Robots | Geniş robot/policy/sim/ROS entegrasyon yüzeyi |
-| Strands Agents | Reasoning, structured planning ve workflow |
-| Hashtag platform | Product profile, jobs, leases, safety, audit ve UX |
+The game uses one 240 × 240 × 5 mm board, six X tokens, six O tokens and two
+250 × 200 × 1.2 mm pickup-zone frames. Ready-to-print files target a Bambu Lab
+P2S with a 0.4 mm nozzle. G-code is machine-specific; use the STL/source files
+and reslice when the exact printer, nozzle, build plate or material differs.
 
-Strands Robots kararlı PyPI sürümünün LeRobot `0.6.0` ile bilinen dependency
-uyuşmazlığı nedeniyle bu baseline'a doğrudan kurulmadı. Runtime capability
-probe hazırdır; uyumlu kararlı release/commit seçilince adapter açılacaktır.
+The pretrained policy was collected against one physical bench layout. This
+release does not claim a universal measured fixture coordinate system. Match
+the public dataset camera framing and run a no-motion/read-only validation; if
+your arm bases, board, pickup zones or cameras move, recalibrate and expect to
+collect or fine-tune data for that geometry.
 
-## Hızlı başlangıç
+## 2. Install the software
 
-Geliştirme ortamı:
+Requirements:
+
+- macOS or Linux for the software-only dashboard; the included direct two-camera
+  physical tic-tac-toe runner currently uses macOS AVFoundation UID capture.
+- Python 3.12 or 3.13, [`uv`](https://docs.astral.sh/uv/), Node.js 24 and `jq`.
+- For physical execution: LeRobot-compatible SO-101 follower hardware, two
+  cameras, valid calibration and an inference device supported by your model.
 
 ```bash
+git clone https://github.com/Hashtag-Robotics/so101-tic-tac-toe.git
+cd so101-tic-tac-toe
 uv sync --extra dev --extra agents --extra sim --extra so101
-npm install --prefix frontend
-```
-
-Dashboard'u build et:
-
-```bash
+npm --prefix frontend ci
 npm --prefix frontend run build
+uv run python scripts/verify_release.py
 ```
 
-Local uygulamayı başlat:
+## 3. Run the UI safely
+
+Start in software-only mode:
 
 ```bash
 HASHTAG_DATA_DIR=.local-data \
+HASHTAG_ENABLE_PHYSICAL=false \
 HASHTAG_OPEN_BROWSER=false \
 uv run hashtag-robotics serve
 ```
 
-Ardından:
-
-```text
-http://127.0.0.1:8765
-```
-
-Read-only sistem kontrolü:
+Open the exact URL printed by the server. The default is
+`http://127.0.0.1:8765`, but a local `.env` or occupied port may change it.
+Then run the read-only diagnostics:
 
 ```bash
 HASHTAG_DATA_DIR=.local-data uv run hashtag-robotics doctor
@@ -87,118 +92,150 @@ HASHTAG_DATA_DIR=.local-data uv run hashtag-robotics capabilities
 uv run hashtag-robotics hil-checklist
 ```
 
-## Doğrulama
+The dashboard provides discovery, profiles, calibration import, camera preview,
+dataset inspection, policy import, guarded rollout jobs, approvals, E-STOP and
+audit history. It binds to loopback and physical adapters remain disabled unless
+explicitly enabled.
 
-Bütün software-only gate'leri:
+## 4. Configure your bench
+
+Never commit a local device profile or calibration:
 
 ```bash
+mkdir -p .local-data
+cp config/ttt-hardware.example.json .local-data/ttt-hardware.json
+```
+
+Edit the local copy with your follower serial path, robot ID, calibration
+directory, top/wrist camera UIDs and inference device. The macOS runner requires
+an executable AVFoundation UID helper; the dashboard's macOS discovery path can
+build it under `.local-data/bin/`. Linux serial paths should normally use stable
+`/dev/serial/by-id/...` links, but the exact physical tic-tac-toe camera adapter
+still needs a Linux implementation.
+
+The feature contract is strict:
+
+```text
+observation.images.top   -> observation.images.camera1
+observation.images.wrist -> observation.images.camera2
+observation.state        -> [6]
+action                   -> [6]
+fps                      -> 30
+```
+
+Swapping the two cameras, reusing a calibration from another follower, or using
+different joint/action dimensions is a hard stop, not a warning.
+
+## 5. Fetch and validate the model without motion
+
+The public checkpoint needs no Hugging Face token:
+
+```bash
+uv run python scripts/fetch_ttt_checkpoint.py \
+  --manifest src/hashtag_robotics/ttt_checkpoint_sweep.json \
+  --policy-root .local-data/policies \
+  --checkpoint 120000
+
+uv run python scripts/load_ttt_checkpoint.py \
+  --manifest src/hashtag_robotics/ttt_checkpoint_sweep.json \
+  --policy-root .local-data/policies \
+  --checkpoint 120000 \
+  --device cpu
+
+python agent.py --inspect
+```
+
+The fetcher downloads only the required inference files and validates the repo
+identity, dataset revision, action shape, camera mapping, empty-camera padding,
+chunk size, training step and batch-size contract. The load-only command then
+constructs the real SmolVLA policy with strict safetensor loading; it performs no
+inference, camera access or robot I/O. `--inspect` also opens no camera and sends
+no robot command. Do not proceed unless it reports the 18 launchers,
+the pinned checkpoint, distinct cameras, the correct follower calibration and
+the expected inference device.
+
+The published config declares `camera1`, `camera2`, legacy `camera3` and one
+`empty_camera_0` slot even though the dataset has two physical cameras. This
+exact schema is pinned and load-tested. Do not connect or remap a third camera;
+the runtime contract remains `top -> camera1`, `wrist -> camera2` with
+`empty_cameras=1`.
+
+## 6. Physical rollout — supervised only
+
+Before power-on:
+
+1. Bolt or clamp both arms and the camera tower; keep every USB cable outside
+   the arm sweep.
+2. Confirm units, six-joint action shape, follower ID, joint limits and current
+   calibration with motors disabled.
+3. Reproduce the dataset framing and ensure board/pickup zones cannot slide.
+4. Place a physical E-STOP or power cut within immediate reach and test it.
+5. Keep one operator at the bench; start with a single low-risk move.
+
+For one deterministic policy move, without a planning LLM:
+
+```bash
+export HASHTAG_ENABLE_PHYSICAL=true
+scripts/run_ttt_checkpoint.zsh 120000 X-5
+```
+
+The launcher checks resource ownership, checkpoint schema, calibration, camera
+identity and the 5-degree relative target clamp, then requires the operator to
+type `HOME` before opening the robot connection.
+
+For a full human-versus-agent game, configure a vision-capable model through a
+standard Strands provider. For example, with a local Ollama model:
+
+```bash
+export HASHTAG_AGENT_MODEL="ollama:<vision-model>"
+export HASHTAG_AGENT_MODEL_HOST="http://localhost:11434"
+export HASHTAG_AGENT_MODEL_OPTIONS='{"temperature":0}'
+export HASHTAG_ENABLE_PHYSICAL=true
+python agent.py --command "Play tic-tac-toe with me"
+```
+
+Bedrock and Anthropic are also supported by the existing Strands runtime; use
+their normal SDK credential/configuration chain and install the corresponding
+provider client. Do not put provider credentials in this repository.
+
+The LLM never receives shell, raw servo or unrestricted robot tools. It chooses
+among 18 fixed move tools; the deterministic controller owns legal moves,
+resource leases, camera mapping, retry limits, session approval and audit. See
+[`TTT_STRANDS_AGENT.md`](TTT_STRANDS_AGENT.md) for the complete contract.
+
+On macOS, importing the current LeRobot media stack can print duplicate
+AVFoundation class warnings because OpenCV and PyAV bundle FFmpeg components.
+If camera capture stalls or crashes, stop before actuation and resolve the media
+environment; do not dismiss the warning during a physical run.
+
+## Training
+
+[`training/README.md`](training/README.md) documents the pinned dataset/base
+model and the Colab A100 recipe used for the 120K artifact. Training loss or an
+offline eval does not replace checkpoint load validation and bounded physical
+evaluation.
+
+## Verification
+
+```bash
+# Repository/artifact/CAD contract; no network or hardware
+uv run python scripts/verify_release.py
+
+# Full software verification
 bash scripts/verify.sh
 ```
 
-Bu workflow:
+CI runs lint, the complete test suite, frontend typecheck/build, wheel install,
+the public-release contract and a separate LeRobot 0.6 compatibility job.
 
-1. Python lint/format kontrolü
-2. Backend/unit/API/contract testleri
-3. Frontend TypeScript kontrolü
-4. Production frontend build
-5. Python sdist/wheel build
-6. Wheel içindeki dashboard asset kontrolü
+## Licenses
 
-çalıştırır.
+- Software and documentation: [Apache License 2.0](LICENSE)
+- Hardware design sources and manufacturing files: [CERN-OHL-P-2.0](hardware/LICENSE)
+- Published SmolVLA model repositories: Apache-2.0, as declared on their model cards
+- Dataset: currently has no declared license metadata (`NOASSERTION`); review this
+  before commercial redistribution or derivative dataset publication
 
-Paket oluşturma:
-
-```bash
-bash scripts/build-package.sh
-```
-
-Üretilen wheel:
-
-```text
-dist/hashtag_robotics-0.1.0-py3-none-any.whl
-```
-
-Temiz ortam kurulumu:
-
-```bash
-uv tool install dist/hashtag_robotics-0.1.0-py3-none-any.whl
-hashtag-robotics
-```
-
-Proje geliştirilirken editable/managed environment için `uv run` tercih edilir.
-
-## Strands Agent Studio
-
-Deterministic agent command gateway model credential'ı olmadan çalışır.
-
-Canlı Strands planning açmak için model ID açıkça verilir:
-
-```bash
-HASHTAG_AGENT_MODEL="<strands-model-id>" \
-HASHTAG_DATA_DIR=.local-data \
-uv run hashtag-robotics serve
-```
-
-Strands modeli hiçbir raw serial, shell veya servo tool görmez. Yalnızca
-structured plan üretir; plan rol izinlerinden geçer ve gerçek execution
-Hashtag Agent Gateway tarafından yapılır.
-
-## Yerel erişim koruması
-
-Control plane loopback'te dinler ve üç bağımsız kapı uygular:
-
-- **Host allowlist** — kendi alan adını `127.0.0.1`'e çözen bir sayfa (DNS
-  rebinding) yine kendi Host başlığını gönderir ve reddedilir.
-- **Origin allowlist** — başka bir sitenin isteği reddedilir.
-- **Oturum token'ı** — koşum başına üretilir, `GET /api/session` ile dashboard'a
-  verilir; `/api/health` dışındaki bütün uçlar ve event soketi bunu ister.
-
-`HASHTAG_ENABLE_PHYSICAL=true` iken loopback dışı bir adrese bind **reddedilir**.
-Başka bir makineden erişmek için SSH tüneli kullanın:
-
-```bash
-ssh -L 8770:127.0.0.1:8770 kullanici@makine
-```
-
-E-stop mandalı kalıcıdır ve yeniden başlatmayı aşar. Panel açılmıyorsa:
-
-```bash
-hashtag-robotics clear-estop
-```
-
-## Fiziksel test
-
-Robotları bağlamadan önce:
-
-1. [HIL Test Planı](docs/HIL_TEST_PLANI_TR.md) tamamen okunmalı.
-2. Kullanıcı `dialout` grubunda olmalı (`sudo usermod -aG dialout <kullanıcı>`,
-   sonra oturum yenilenmeli; yenilenmediyse komutlar `sg dialout -c '...'` ile
-   sarılmalı).
-3. `hashtag-robotics doctor` blocked sonuç vermemeli.
-4. Leader/follower port ve kimlikleri read-only çözülmeli.
-5. Mevcut calibration `hashtag-robotics import-calibration <dizin>` ile içe
-   aktarılmalı; kalibrasyon işi zaten başlamadan önce yedek alır.
-6. E-stop yolu robot enerjilenmeden doğrulanmalı.
-7. İlk hareket calibration değil, düşük limitli kısa teleop preflight olmalı.
-
-`HASHTAG_ENABLE_PHYSICAL=true` yalnız fiziksel test oturumunda ve kullanıcı
-hazırken açılır.
-
-## Dokümanlar
-
-Önerilen okuma sırası:
-
-1. [Ekosistem Araştırması](docs/EKOSISTEM_ARASTIRMASI_TR.md)
-2. [Hedef Ürün ve Backend Mimarisi](docs/HEDEF_MIMARI_TR.md)
-3. [Uygulama Durumu](docs/UYGULAMA_DURUMU_TR.md)
-4. [Workflow Kataloğu](docs/WORKFLOW_KATALOGU_TR.md)
-5. [Uyumluluk Matrisi](docs/UYUMLULUK_MATRISI_TR.md)
-6. [Faz Bazlı Yol Haritası](docs/YOL_HARITASI_TR.md)
-7. [HIL Test Planı](docs/HIL_TEST_PLANI_TR.md)
-8. [Ürün Kararları ve Risk Kaydı](docs/KARARLAR_VE_RISKLER_TR.md)
-
-## Güvenlik sınırı
-
-Bu sürüm fiziksel test hazırlığıdır; doğrulanmış production robot controller
-değildir. Gerçek SO-101 testleri Mert'in robotları bağlaması, çalışma alanını
-hazırlaması ve her actuation adımını açıkça onaylamasıyla birlikte yapılacaktır.
+Hashtag Robotics names and logos are trademarks and are not licensed as product
+branding. See [NOTICE](NOTICE), [hardware/NOTICE](hardware/NOTICE),
+[SECURITY.md](SECURITY.md) and [CONTRIBUTING.md](CONTRIBUTING.md).

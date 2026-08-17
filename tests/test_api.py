@@ -57,7 +57,9 @@ def test_tic_tac_toe_rollout_catalogue_is_complete_and_server_owned(
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["profile"] == "tic_tac_toe_80k"
+    assert payload["profile"] == "tic_tac_toe_games_1_15_120k"
+    assert payload["policy_repo_id"] == ("HashtagRobotics/smolvla-tic-tac-toe-games-1-15-120k")
+    assert payload["policy_revision"] == "48a6313b7e4983781dd72919105ca691a77cd26c"
     assert len(payload["moves"]) == 18
     x7 = next(move for move in payload["moves"] if move["id"] == "X-7")
     assert x7["episode_index"] == 45

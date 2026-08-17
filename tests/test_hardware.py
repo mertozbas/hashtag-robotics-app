@@ -361,7 +361,7 @@ def test_tic_tac_toe_rollout_uses_the_bench_validated_recorded_contract(
     parameters.update(
         {
             "robot_port": "/dev/follower",
-            "robot_id": "denizli",
+            "robot_id": "test_follower",
             "robot_calibration_dir": "/tmp/calibration/robots/so_follower",
             "max_relative_target": 5.0,
             "policy_path": "/tmp/models/smolvla",

@@ -166,7 +166,7 @@ def test_macos_camera_discovery_keeps_identity_separate_from_current_index() -> 
       "SPCameraDataType": [{
         "_name": "USB2.0_CAM1",
         "spcamera_model-id": "UVC Camera VendorID_1443 ProductID_37424",
-        "spcamera_unique-id": "0x210000005a39230"
+        "spcamera_unique-id": "test-camera-uid-a"
       }]
     }"""
     listing = """
@@ -181,7 +181,7 @@ def test_macos_camera_discovery_keeps_identity_separate_from_current_index() -> 
 
     assert len(devices) == 1
     assert devices[0].name == "USB2.0_CAM1"
-    assert devices[0].serial_number == "0x210000005a39230"
+    assert devices[0].serial_number == "test-camera-uid-a"
     assert devices[0].identity_stable is True
     assert devices[0].transient_path == "avfoundation:1"
     assert "avfoundation" in devices[0].capabilities
@@ -218,19 +218,19 @@ def test_uvc_identity_survives_moving_the_hub_to_another_mac_port() -> None:
       "SPCameraDataType": [{{
         "_name": "USB2.0_CAM1",
         "spcamera_model-id": "{model}",
-        "spcamera_unique-id": "0x211000005a39230"
+        "spcamera_unique-id": "0xdeadbeef00abc123"
       }}]
     }}'''
     new_profile = f'''{{
       "SPCameraDataType": [{{
         "_name": "USB2.0_CAM1",
         "spcamera_model-id": "{model}",
-        "spcamera_unique-id": "0x11000005a39230"
+        "spcamera_unique-id": "0x00adbeef00abc123"
       }}]
     }}'''
 
-    old = _parse_avfoundation_native_cameras(old_profile, "0\t0x211000005a39230\tUSB2.0_CAM1\n")[0]
-    new = _parse_avfoundation_native_cameras(new_profile, "0\t0x11000005a39230\tUSB2.0_CAM1\n")[0]
+    old = _parse_avfoundation_native_cameras(old_profile, "0\t0xdeadbeef00abc123\tUSB2.0_CAM1\n")[0]
+    new = _parse_avfoundation_native_cameras(new_profile, "0\t0x00adbeef00abc123\tUSB2.0_CAM1\n")[0]
 
     assert old.stable_fingerprint == new.stable_fingerprint
     assert old.id == new.id
@@ -241,7 +241,7 @@ def test_two_identical_uvc_cameras_in_different_hub_sockets_stay_distinct() -> N
     profile = """{
       "SPCameraDataType": []
     }"""
-    native = "0\t0x11000005a39230\tUSB2.0_CAM1\n1\t0x12000005a39230\tUSB2.0_CAM1\n"
+    native = "0\t0x00adbeef00abc123\tUSB2.0_CAM1\n1\t0x00adbeee00abc123\tUSB2.0_CAM1\n"
 
     devices = _parse_avfoundation_native_cameras(profile, native)
 
@@ -284,10 +284,10 @@ def test_macos_camera_snapshot_auto_refreshes_after_hotplug_interval(monkeypatch
       "SPCameraDataType": [{
         "_name": "USB2.0_CAM1",
         "spcamera_model-id": "UVC Camera",
-        "spcamera_unique-id": "0x11000005a39230"
+        "spcamera_unique-id": "test-camera-uid-c"
       }]
     }"""
-    native = "0\t0x11000005a39230\tUSB2.0_CAM1\n"
+    native = "0\ttest-camera-uid-c\tUSB2.0_CAM1\n"
     calls: list[tuple[str, ...]] = []
     now = [0.0]
 
